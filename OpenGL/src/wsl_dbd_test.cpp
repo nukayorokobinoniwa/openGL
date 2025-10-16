@@ -50,14 +50,14 @@ const float spawnX = 0.0f, spawnY = 2.2f, spawnZ = 10.0f;
 float cameraX = spawnX, cameraY = spawnY, cameraZ = spawnZ;
 float yaw = -M_PI / 2.0f;
 float pitch = 0.0f;
-int lastMouseX, lastMouseY; // 前回のマウス位置を記憶
-bool firstMouse = true;    // 最初のマウス入力を判定
+int lastMouseX, lastMouseY;
+bool firstMouse = true;
 const float moveSpeed = 0.15f;
-const float mouseSensitivity = 0.003f; // 感度を下げた値
+const float mouseSensitivity = 0.005f;
 int windowWidth = 1600, windowHeight = 900;
 bool keyStates[256] = {false};
-bool justWarped = false; // ワープ直後かを判定
-bool isMouseLookActive = true; // ウィンドウがアクティブか判定
+bool justWarped = false;
+bool isMouseLookActive = true;
 
 GLuint groundTextureID;
 GLuint wallTextureID;
@@ -485,29 +485,34 @@ void keyboard(unsigned char key, int x, int y) {
 void keyboardUp(unsigned char key, int x, int y) { keyStates[tolower(key)] = false; }
 
 /**
- * @brief マウスが動いたときの処理を行うコールバック関数 (新方式・安定版)
+ * @brief マウスが動いたときの処理を行うコールバック関数
  */
 void mouseMotion(int x, int y) {
     if (!isMouseLookActive) {
         return;
     }
 
-    int centerX = windowWidth / 2;
-    int centerY = windowHeight / 2;
+    if (justWarped) {
+        justWarped = false;
+        return;
+    }
 
-    // マウスが中央にある場合は、ワープ処理によるイベントなので無視する
-    if (x == centerX && y == centerY) {
+    if (firstMouse) {
+        lastMouseX = x;
+        lastMouseY = y;
+        firstMouse = false;
         return;
     }
     
-    // 画面中央からの差分を計算
-    float deltaX = (float)(x - centerX);
-    float deltaY = (float)(centerY - y); // Y軸は上がプラスになるように反転
+    float deltaX = (float)(x - lastMouseX);
+    float deltaY = (float)(lastMouseY - y);
+
+    lastMouseX = x;
+    lastMouseY = y;
 
     yaw += deltaX * mouseSensitivity;
     pitch += deltaY * mouseSensitivity;
 
-    // 縦方向の視点移動に制限をかける
     if (pitch > M_PI_2 - 0.1f) {
         pitch = M_PI_2 - 0.1f;
     }
@@ -515,8 +520,13 @@ void mouseMotion(int x, int y) {
         pitch = -M_PI_2 + 0.1f;
     }
 
-    // 処理が終わったらカーソルを中央に戻す
-    glutWarpPointer(centerX, centerY);
+    // ▼▼▼ 端の判定を50pxから10pxに変更 ▼▼▼
+    if (x < 10 || x > windowWidth - 10 || y < 10 || y > windowHeight - 10) {
+        lastMouseX = windowWidth / 2;
+        lastMouseY = windowHeight / 2;
+        glutWarpPointer(lastMouseX, lastMouseY);
+        justWarped = true;
+    }
 }
 
 /**
@@ -531,15 +541,14 @@ void reshape(int w, int h) {
 }
 
 /**
- * @brief マウスがウィンドウ内に出入りした際の処理 (新方式)
+ * @brief マウスがウィンドウ内に出入りした際の処理
  */
 void entry(int state) {
     if (state == GLUT_ENTERED) {
         isMouseLookActive = true;
-        glutSetCursor(GLUT_CURSOR_NONE); // カーソルを非表示に
+        firstMouse = true;
     } else if (state == GLUT_LEFT) {
         isMouseLookActive = false;
-        glutSetCursor(GLUT_CURSOR_INHERIT); // カーソルを通常表示に
     }
 }
 
@@ -576,9 +585,9 @@ void initScene() {
 int main(int argc, char** argv) {
     setlocale(LC_NUMERIC, "C");
     glutInit(&argc, argv);
-    glutInitDisplayMode(GLUT_DOUBLE | GLUT_RGB | GL_DEPTH);
+    glutInitDisplayMode(GLUT_DOUBLE | GLUT_RGB | GLUT_DEPTH);
     glutInitWindowSize(windowWidth, windowHeight);
-    glutCreateWindow("3D FPS Controller - Robust View");
+    glutCreateWindow("3D FPS Controller - Edge Warp Fixed");
     initScene();
     glutIgnoreKeyRepeat(1);
     glutDisplayFunc(display);
@@ -589,9 +598,6 @@ int main(int argc, char** argv) {
     glutKeyboardUpFunc(keyboardUp);
     glutTimerFunc(0, update, 0);
     glutEntryFunc(entry);
-
-    // 最初に一度カーソルを中央に設定
-    glutWarpPointer(windowWidth / 2, windowHeight / 2);
 
     glutMainLoop();
     return 0;
