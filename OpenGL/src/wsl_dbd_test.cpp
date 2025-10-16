@@ -50,12 +50,14 @@ const float spawnX = 0.0f, spawnY = 2.2f, spawnZ = 10.0f;
 float cameraX = spawnX, cameraY = spawnY, cameraZ = spawnZ;
 float yaw = -M_PI / 2.0f;
 float pitch = 0.0f;
-int lastMouseX, lastMouseY;
-bool firstMouse = true;
+int lastMouseX, lastMouseY; // 前回のマウス位置を記憶
+bool firstMouse = true;    // 最初のマウス入力を判定
 const float moveSpeed = 0.15f;
-const float mouseSensitivity = 0.005f;
-int windowWidth = 800, windowHeight = 600;
+const float mouseSensitivity = 0.003f; // 感度を下げた値
+int windowWidth = 1600, windowHeight = 900;
 bool keyStates[256] = {false};
+bool justWarped = false; // ワープ直後かを判定
+bool isMouseLookActive = true; // ウィンドウがアクティブか判定
 
 GLuint groundTextureID;
 GLuint wallTextureID;
@@ -145,30 +147,20 @@ void drawObjModel(const Model& model, float x, float y, float z, float scale, fl
 }
 
 /**
- * @brief 資料を基に、OpenCVで画像ファイルを読み込む関数
+ * @brief OpenCVで画像ファイルを読み込む関数
  */
 bool loadTexture(const char* filename, GLuint& textureID) {
-    // 画像を読み込んでMatに格納
     cv::Mat image = cv::imread(filename);
     if (image.empty()) {
         printf("Error: Image not found: %s\n", filename);
         return false;
     }
-    // OpenGLのテクスチャは上下が逆なので、反転させておく
     cv::flip(image, image, 0);
 
     glGenTextures(1, &textureID);
     glBindTexture(GL_TEXTURE_2D, textureID);
-
-    // テクスチャ画像はバイト単位に詰め込まれていることを指定
     glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
-
-    // テクスチャの割り当て
-    glTexImage2D(GL_TEXTURE_2D, 0, 3, image.cols, image.rows, 0, 
-                 GL_BGR, // 資料の通り、OpenCVのBGR形式を指定
-                 GL_UNSIGNED_BYTE, image.data);
-
-    // テクスチャを拡大・縮小する方法の指定
+    glTexImage2D(GL_TEXTURE_2D, 0, 3, image.cols, image.rows, 0, GL_BGR, GL_UNSIGNED_BYTE, image.data);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_REPEAT);
@@ -220,7 +212,7 @@ void drawGround() {
     GLfloat ground_mat[] = {1.0f, 1.0f, 1.0f, 1.0f};
     glMaterialfv(GL_FRONT, GL_AMBIENT_AND_DIFFUSE, ground_mat);
     glBindTexture(GL_TEXTURE_2D, groundTextureID);
-    glColor3f(1.0f, 1.0f, 1.0f); // ライティング下でもテクスチャの色が見えるように
+    glColor3f(1.0f, 1.0f, 1.0f);
     glBegin(GL_QUADS);
         glNormal3f(0,1,0);
         glTexCoord2f(0.0f, 0.0f);   glVertex3f(-50.0, 0.0, -50.0);
@@ -245,7 +237,7 @@ void drawWalls() {
         float texY = height * texRepeatScale;
         float texZ = depth * texRepeatScale;
         
-        glColor3f(1.0f, 1.0f, 1.0f); // ライティング下でもテクスチャの色が見えるように
+        glColor3f(1.0f, 1.0f, 1.0f);
 
         glBegin(GL_QUADS);
         // Front Face
@@ -395,6 +387,35 @@ void updatePallets() {
 }
 
 /**
+ * @brief 当たり判定をチェックするためのヘルパー関数
+ */
+bool checkCollision(float x, float z) {
+    const float playerWidth = 0.2f;
+
+    for (const auto& box : wallColliders) {
+        if (x + playerWidth > box.minX && x - playerWidth < box.maxX &&
+            z + playerWidth > box.minZ && z - playerWidth < box.maxZ) {
+            return true;
+        }
+    }
+
+    for (const auto& pallet : pallets) {
+        if (pallet.state != IDLE) {
+            float translatedX = x - pallet.x;
+            float translatedZ = z - pallet.z;
+            float angleRad = -pallet.rotationY * M_PI / 180.0f;
+            float localX = translatedX * cos(angleRad) - translatedZ * sin(angleRad);
+            float localZ = translatedX * sin(angleRad) + translatedZ * cos(angleRad);
+            if (localX + playerWidth > pallet.localBBox.minX * pallet.scale && localX - playerWidth < pallet.localBBox.maxX * pallet.scale &&
+                localZ + playerWidth > pallet.localBBox.minZ * pallet.scale && localZ - playerWidth < pallet.localBBox.maxZ * pallet.scale) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+/**
  * @brief タイマーで呼び出され、プレイヤーの位置やオブジェクトの状態を更新する
  */
 void update(int value) {
@@ -405,55 +426,30 @@ void update(int value) {
     float moveX = 0.0f, moveZ = 0.0f;
     if (keyStates['w']) { moveX += forwardX; moveZ += forwardZ; } if (keyStates['s']) { moveX -= forwardX; moveZ -= forwardZ; }
     if (keyStates['a']) { moveX -= rightX; moveZ -= rightZ; } if (keyStates['d']) { moveX += rightX; moveZ += rightZ; }
+    
     float magnitude = sqrt(moveX * moveX + moveZ * moveZ);
-    if (magnitude > 0) { moveX /= magnitude; moveZ /= magnitude; }
-    const float playerWidth = 0.2f;
+    if (magnitude > 0) {
+        moveX /= magnitude;
+        moveZ /= magnitude;
+    }
+    
+    float move_vec_x = moveX * moveSpeed;
+    float move_vec_z = moveZ * moveSpeed;
 
-    float nextX = cameraX + moveX * moveSpeed;
-    bool collisionX = false;
-    for (const auto& box : wallColliders) {
-        if (nextX + playerWidth > box.minX && nextX - playerWidth < box.maxX && cameraZ + playerWidth > box.minZ && cameraZ - playerWidth < box.maxZ) {
-            collisionX = true; break;
+    if (!checkCollision(cameraX + move_vec_x, cameraZ + move_vec_z)) {
+        cameraX += move_vec_x;
+        cameraZ += move_vec_z;
+    } else {
+        if (!checkCollision(cameraX + move_vec_x, cameraZ)) {
+            cameraX += move_vec_x;
+        }
+        if (!checkCollision(cameraX, cameraZ + move_vec_z)) {
+            cameraZ += move_vec_z;
         }
     }
-    if (!collisionX) {
-        for (const auto& pallet : pallets) {
-            if (pallet.state != IDLE) {
-                float translatedX = nextX - pallet.x, translatedZ = cameraZ - pallet.z;
-                float angleRad = -pallet.rotationY * M_PI / 180.0f;
-                float localX = translatedX * cos(angleRad) - translatedZ * sin(angleRad), localZ = translatedX * sin(angleRad) + translatedZ * cos(angleRad);
-                if (localX + playerWidth > pallet.localBBox.minX * pallet.scale && localX - playerWidth < pallet.localBBox.maxX * pallet.scale &&
-                    localZ + playerWidth > pallet.localBBox.minZ * pallet.scale && localZ - playerWidth < pallet.localBBox.maxZ * pallet.scale) {
-                    collisionX = true; break;
-                }
-            }
-        }
-    }
-    if (!collisionX) { cameraX = nextX; }
-
-    float nextZ = cameraZ + moveZ * moveSpeed;
-    bool collisionZ = false;
-    for (const auto& box : wallColliders) {
-        if (cameraX + playerWidth > box.minX && cameraX - playerWidth < box.maxX && nextZ + playerWidth > box.minZ && nextZ - playerWidth < box.maxZ) {
-            collisionZ = true; break;
-        }
-    }
-    if (!collisionZ) {
-        for (const auto& pallet : pallets) {
-            if (pallet.state != IDLE) {
-                float translatedX = cameraX - pallet.x, translatedZ = nextZ - pallet.z;
-                float angleRad = -pallet.rotationY * M_PI / 180.0f;
-                float localX = translatedX * cos(angleRad) - translatedZ * sin(angleRad), localZ = translatedX * sin(angleRad) + translatedZ * cos(angleRad);
-                if (localX + playerWidth > pallet.localBBox.minX * pallet.scale && localX - playerWidth < pallet.localBBox.maxX * pallet.scale &&
-                    localZ + playerWidth > pallet.localBBox.minZ * pallet.scale && localZ - playerWidth < pallet.localBBox.maxZ * pallet.scale) {
-                    collisionZ = true; break;
-                }
-            }
-        }
-    }
-    if (!collisionZ) { cameraZ = nextZ; }
 
     cameraY = spawnY;
+    
     glutPostRedisplay();
     glutTimerFunc(16, update, 0);
 }
@@ -489,19 +485,38 @@ void keyboard(unsigned char key, int x, int y) {
 void keyboardUp(unsigned char key, int x, int y) { keyStates[tolower(key)] = false; }
 
 /**
- * @brief マウスが動いたときの処理を行うコールバック関数
+ * @brief マウスが動いたときの処理を行うコールバック関数 (新方式・安定版)
  */
 void mouseMotion(int x, int y) {
-    if (firstMouse) { lastMouseX = x; lastMouseY = y; firstMouse = false; return; }
-    float deltaX = (float)(x - lastMouseX), deltaY = (float)(lastMouseY - y);
-    lastMouseX = x; lastMouseY = y;
-    yaw += deltaX * mouseSensitivity; pitch += deltaY * mouseSensitivity;
-    if (pitch > M_PI_2 - 0.1f) { pitch = M_PI_2 - 0.1f; }
-    if (pitch < -M_PI_2 + 0.1f) { pitch = -M_PI_2 + 0.1f; }
-    if (x < 50 || x > windowWidth - 50 || y < 50 || y > windowHeight - 50) {
-        lastMouseX = windowWidth / 2; lastMouseY = windowHeight / 2;
-        glutWarpPointer(lastMouseX, lastMouseY);
+    if (!isMouseLookActive) {
+        return;
     }
+
+    int centerX = windowWidth / 2;
+    int centerY = windowHeight / 2;
+
+    // マウスが中央にある場合は、ワープ処理によるイベントなので無視する
+    if (x == centerX && y == centerY) {
+        return;
+    }
+    
+    // 画面中央からの差分を計算
+    float deltaX = (float)(x - centerX);
+    float deltaY = (float)(centerY - y); // Y軸は上がプラスになるように反転
+
+    yaw += deltaX * mouseSensitivity;
+    pitch += deltaY * mouseSensitivity;
+
+    // 縦方向の視点移動に制限をかける
+    if (pitch > M_PI_2 - 0.1f) {
+        pitch = M_PI_2 - 0.1f;
+    }
+    if (pitch < -M_PI_2 + 0.1f) {
+        pitch = -M_PI_2 + 0.1f;
+    }
+
+    // 処理が終わったらカーソルを中央に戻す
+    glutWarpPointer(centerX, centerY);
 }
 
 /**
@@ -513,6 +528,19 @@ void reshape(int w, int h) {
     glMatrixMode(GL_PROJECTION); glLoadIdentity();
     gluPerspective(45.0, (double)w / (double)h, 0.1, 200.0);
     glMatrixMode(GL_MODELVIEW);
+}
+
+/**
+ * @brief マウスがウィンドウ内に出入りした際の処理 (新方式)
+ */
+void entry(int state) {
+    if (state == GLUT_ENTERED) {
+        isMouseLookActive = true;
+        glutSetCursor(GLUT_CURSOR_NONE); // カーソルを非表示に
+    } else if (state == GLUT_LEFT) {
+        isMouseLookActive = false;
+        glutSetCursor(GLUT_CURSOR_INHERIT); // カーソルを通常表示に
+    }
 }
 
 void initScene() {
@@ -548,9 +576,9 @@ void initScene() {
 int main(int argc, char** argv) {
     setlocale(LC_NUMERIC, "C");
     glutInit(&argc, argv);
-    glutInitDisplayMode(GLUT_DOUBLE | GLUT_RGB | GLUT_DEPTH);
+    glutInitDisplayMode(GLUT_DOUBLE | GLUT_RGB | GL_DEPTH);
     glutInitWindowSize(windowWidth, windowHeight);
-    glutCreateWindow("3D FPS Controller with OpenCV Texture");
+    glutCreateWindow("3D FPS Controller - Robust View");
     initScene();
     glutIgnoreKeyRepeat(1);
     glutDisplayFunc(display);
@@ -560,6 +588,11 @@ int main(int argc, char** argv) {
     glutKeyboardFunc(keyboard);
     glutKeyboardUpFunc(keyboardUp);
     glutTimerFunc(0, update, 0);
+    glutEntryFunc(entry);
+
+    // 最初に一度カーソルを中央に設定
+    glutWarpPointer(windowWidth / 2, windowHeight / 2);
+
     glutMainLoop();
     return 0;
 }
