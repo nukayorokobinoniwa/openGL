@@ -14,7 +14,7 @@
 #define TINYOBJLOADER_IMPLEMENTATION
 #include "tiny_obj_loader.h"
 
-// モデルデータをまとめて管理するための構造体
+// モデルデータをまとめて管理するsための構造体
 struct Model {
     tinyobj::attrib_t attrib;
     std::vector<tinyobj::shape_t> shapes;
