@@ -20,7 +20,7 @@ struct Model {
     bool loaded = false;
 };
 
-// 当たり判定用の構造体
+// 当たり判定用の構造体 (AABB)
 struct BoundingBox {
     float minX, maxX, minY, maxY, minZ, maxZ;
 };
@@ -68,7 +68,7 @@ Model testModel;
 Model paletModel;
 Model blenderModel;
 
-std::vector<BoundingBox> wallColliders;
+std::vector<BoundingBox> wallColliders; // AABB (回転しない壁)
 std::vector<Pallet> pallets;
 
 // --- 関数定義 ---
@@ -279,23 +279,122 @@ void drawWalls() {
         glEnd();
     };
 
-    auto drawWall = [&](float x, float z, float width, float depth, float height) {
+    // (x, y, z) を左下隅の座標として、(width, height, depth) の壁を描画するヘルパー
+    // (X軸方向に width, Z軸方向に depth を持つ)
+    auto drawWallSegment = [&](float x, float y, float z, float width, float depth, float height, float rx, float ry, float rz) {
         glPushMatrix();
-        glTranslatef(x + width / 2.0f, height / 2.0f, z + depth / 2.0f);
+        // 中心座標 (x + width/2, y + height/2, z + depth/2) に移動
+        glTranslatef(x + width / 2.0f, y + height / 2.0f, z + depth / 2.0f);
+        
+        glRotatef(ry, 0.0f, 1.0f, 0.0f); // Y軸回転
+        glRotatef(rx, 1.0f, 0.0f, 0.0f); // X軸回転
+        glRotatef(rz, 0.0f, 0.0f, 1.0f); // Z軸回転
+
         glScalef(width, height, depth);
         drawTexturedCube(width, height, depth);
         glPopMatrix();
     };
 
+    // (Z軸方向に width, X軸方向に depth を持つ) 壁を描画するヘルパー
+    auto drawWallSegmentY = [&](float x, float y, float z, float width, float depth, float height, float rx, float ry, float rz) {
+        glPushMatrix();
+        // 中心座標 (x + depth/2, y + height/2, z + width/2) に移動
+        glTranslatef(x + depth / 2.0f, y + height / 2.0f, z + width / 2.0f);
+        
+        glRotatef(ry, 0.0f, 1.0f, 0.0f); // Y軸回転
+        glRotatef(rx, 1.0f, 0.0f, 0.0f); // X軸回転
+        glRotatef(rz, 0.0f, 0.0f, 1.0f); // Z軸回転
+
+        // スケールを (depth, height, width) にする
+        glScalef(depth, height, width);
+        drawTexturedCube(depth, height, width);
+        glPopMatrix();
+    };
+
+
+    // 既存の drawWall の定義 (X軸方向に伸びる)
+    auto drawWall = [&](float x, float z, float width, float depth, float height, float rx, float ry, float rz) {
+        drawWallSegment(x, 0.0f, z, width, depth, height, rx, ry, rz);
+    };
+
+    // 窓付きの壁を描画する関数 (X軸方向に伸びる)
+    auto drawWindowWalls = [&](float x, float z, float width, float depth, float height, float rx, float ry, float rz) {
+        const float windowWidthRatio = 0.4f;
+        const float windowHeightRatio = 0.4f;
+        float windowWidth = width * windowWidthRatio;
+        float windowHeight = height * windowHeightRatio;
+        float marginWidth = (width - windowWidth) / 2.0f;
+        float marginHeight = (height - windowHeight) / 2.0f;
+
+        drawWallSegment(x, 0.0f, z, width, depth, marginHeight, rx, ry, rz); // 下の壁
+        float topY = marginHeight + windowHeight;
+        drawWallSegment(x, topY, z, width, depth, marginHeight, rx, ry, rz); // 上の壁
+        drawWallSegment(x, marginHeight, z, marginWidth, depth, windowHeight, rx, ry, rz); // 左の壁
+        float rightX = x + marginWidth + windowWidth;
+        drawWallSegment(rightX, marginHeight, z, marginWidth, depth, windowHeight, rx, ry, rz); // 右の壁
+    };
+
+    // 新設: 窓付きの壁を描画する関数 (Z軸方向に伸びる)
+    auto drawWindowWallY = [&](float x, float z, float width, float depth, float height, float rx, float ry, float rz) {
+        const float windowWidthRatio = 0.4f;
+        const float windowHeightRatio = 0.4f;
+        float windowWidth = width * windowWidthRatio; // Z軸方向の窓の幅
+        float windowHeight = height * windowHeightRatio; // Y軸方向の窓の高さ
+        float marginWidth = (width - windowWidth) / 2.0f; // Z軸方向のマージン
+        float marginHeight = (height - windowHeight) / 2.0f; // Y軸方向のマージン
+
+        // drawWallSegmentY を使用 (width がZ軸方向, depth がX軸方向)
+        drawWallSegmentY(x, 0.0f, z, width, depth, marginHeight, rx, ry, rz); // 下の壁
+        float topY = marginHeight + windowHeight;
+        drawWallSegmentY(x, topY, z, width, depth, marginHeight, rx, ry, rz); // 上の壁
+        
+        drawWallSegmentY(x, marginHeight, z, marginWidth, depth, windowHeight, rx, ry, rz); // 左の壁 (Z軸基準)
+        float rightZ = z + marginWidth + windowWidth;
+        drawWallSegmentY(x, marginHeight, rightZ, marginWidth, depth, windowHeight, rx, ry, rz); // 右の壁 (Z軸基準)
+    };
+
+
+    // 中央に仕切りがある壁を描画する関数 (X軸方向に伸びる)
+    auto drawDividedWall = [&](float x, float z, float width, float depth, float height, float rx, float ry, float rz) {
+        const float dividerThickness = 0.5f; 
+        float sideWallWidth = (width - dividerThickness) / 2.0f;
+        drawWallSegment(x, 0.0f, z, sideWallWidth, depth, height, rx, ry, rz); 
+        float dividerX = x + sideWallWidth;
+        drawWallSegment(dividerX, 0.0f, z, dividerThickness, depth, height, rx, ry, rz); 
+        float rightWallX = dividerX + dividerThickness;
+        drawWallSegment(rightWallX, 0.0f, z, sideWallWidth, depth, height, rx, ry, rz); 
+    };
+
+
     float wall_height = 3.6f, wall_thick = 0.5f;
-    drawWall(15.0f,-45.0f,10.0f,wall_thick,wall_height); drawWall(30.0f,-45.0f,10.0f,wall_thick,wall_height);
-    drawWall(15.0f,-42.5f,wall_thick,5.0f,wall_height); drawWall(40.0f,-42.5f,wall_thick,5.0f,wall_height);
-    drawWall(15.0f,-25.0f,10.0f,wall_thick,wall_height); drawWall(30.0f,-25.0f,10.0f,wall_thick,wall_height);
-    drawWall(15.0f,-27.5f,wall_thick,5.0f,wall_height); drawWall(40.0f,-27.5f,wall_thick,5.0f,wall_height);
-    drawWall(15.0f,-5.0f,30.0f,wall_thick,wall_height); drawWall(40.0f,0.0f,5.0f,wall_thick,wall_height);
-    drawWall(15.0f,0.0f,20.0f,wall_thick,wall_height); drawWall(15.0f,5.0f,30.0f,wall_thick,wall_height);
-    drawWall(-45.0f,35.0f,30.0f,wall_thick,wall_height); drawWall(-20.0f,40.0f,5.0f,wall_thick,wall_height);
-    drawWall(-45.0f,40.0f,20.0f,wall_thick,wall_height); drawWall(-45.0f,45.0f,30.0f,wall_thick,wall_height);
+    
+    drawWall(15.0f,-45.0f,10.0f,wall_thick,wall_height, 0.0f, 0.0f, 0.0f);
+    drawWall(30.0f,-45.0f,10.0f,wall_thick,wall_height, 0.0f, 0.0f, 0.0f);
+    drawWall(15.0f,-45.0f,wall_thick,5.0f,wall_height, 0.0f, 0.0f, 0.0f);
+    drawWall(40.0f,-45.0f,wall_thick,5.0f,wall_height, 0.0f, 0.0f, 0.0f);
+    drawWall(15.0f,-25.0f,10.0f,wall_thick,wall_height, 0.0f, 0.0f, 0.0f);
+    drawWall(30.0f,-25.0f,10.0f,wall_thick,wall_height, 0.0f, 0.0f, 0.0f);
+    drawWall(15.0f,-30.0f,wall_thick,5.0f,wall_height, 0.0f, 0.0f, 0.0f);
+    drawWall(40.0f,-30.0f,wall_thick,5.0f,wall_height, 0.0f, 0.0f, 0.0f);
+    drawWall(15.0f,-5.0f,30.0f,wall_thick,wall_height, 0.0f, 0.0f, 0.0f);
+    drawWall(40.0f,0.0f,5.0f,wall_thick,wall_height, 0.0f, 0.0f, 0.0f);
+    drawWall(15.0f,0.0f,20.0f,wall_thick,wall_height, 0.0f, 0.0f, 0.0f);
+    drawWall(15.0f,5.0f,30.0f,wall_thick,wall_height, 0.0f, 0.0f, 0.0f);
+    drawWall(-45.0f,35.0f,30.0f,wall_thick,wall_height, 0.0f, 0.0f, 0.0f);
+    drawWall(-20.0f,40.0f,5.0f,wall_thick,wall_height, 0.0f, 0.0f, 0.0f);
+    drawWall(-45.0f,40.0f,20.0f,wall_thick,wall_height, 0.0f, 0.0f, 0.0f);
+    drawWall(-45.0f,45.0f,30.0f,wall_thick,wall_height, 0.0f, 0.0f, 0.0f);
+    drawWall(10.0f,-41.0f,wall_thick,3.0f,wall_height, 0.0f, 0.0f, 0.0f);//追加
+    drawWall(-10.0f,-31.0f,wall_thick,3.0f,wall_height, 0.0f, 0.0f, 0.0f);//追加
+
+    // ★ (-10, 0, 35) に Z軸方向に伸びる窓付きの壁を追加
+    drawWindowWallY(-10.0f, 35.0f, 10.0f, wall_thick, wall_height, 0.0f, 0.0f, 0.0f);
+
+    // ★ (-10, 0, -30) に X軸方向に伸びる窓付きの壁を追加
+    drawWindowWalls(-10.0f, -30.0f, 10.0f, wall_thick, wall_height, 0.0f, 0.0f, 0.0f);
+
+    // ★ (0, 0, -40) に X軸方向に伸びる窓付きの壁を追加
+    drawWindowWalls(0.0f, -40.0f, 10.0f, wall_thick, wall_height, 0.0f, 0.0f, 0.0f);
 }
 
 /**
@@ -303,6 +402,7 @@ void drawWalls() {
  */
 void setupColliders() {
     wallColliders.clear();
+
     auto addCollider = [](float x, float z, float width, float depth) {
         wallColliders.push_back({x, x + width, 0, 0, z, z + depth});
     };
@@ -315,7 +415,99 @@ void setupColliders() {
     addCollider(15.0f,0.0f,20.0f,wall_thick); addCollider(15.0f,5.0f,30.0f,wall_thick);
     addCollider(-45.0f,35.0f,30.0f,wall_thick); addCollider(-20.0f,40.0f,5.0f,wall_thick);
     addCollider(-45.0f,40.0f,20.0f,wall_thick); addCollider(-45.0f,45.0f,30.0f,wall_thick);
+    // ★ 追加した壁の当たり判定
+    addCollider(10.0f,-41.0f,wall_thick,3.0f); 
+    addCollider(-10.0f,-31.0f,wall_thick,3.0f); 
+
+    // --- (-10, 0, 35) に追加した窓付き壁 (drawWindowWallY) の当たり判定 (AABB) ---
+    { 
+        float wall_height = 3.6f;
+        float wall_width_z = 10.0f; // Z軸方向の幅
+        float wall_depth_x = wall_thick; // X軸方向の奥行き (0.5f)
+
+        const float windowWidthRatio = 0.4f;
+        const float windowHeightRatio = 0.4f;
+        float windowWidth = wall_width_z * windowWidthRatio; // Z軸方向の窓の幅 (4.0f)
+        float marginWidth = (wall_width_z - windowWidth) / 2.0f; // Z軸方向のマージン (3.0f)
+
+        float startX = -10.0f; // X座標の開始位置
+        float startZ = 35.0f; // Z座標の開始位置
+
+        // 1. 下の壁 (X: -10.0～-9.5, Z: 35.0～45.0)
+        addCollider(startX, startZ, wall_depth_x, wall_width_z);
+        // 2. 上の壁 (X: -10.0～-9.5, Z: 35.0～45.0)
+        addCollider(startX, startZ, wall_depth_x, wall_width_z);
+        // 3. 左の壁 (X: -10.0～-9.5, Z: 35.0～38.0)
+        addCollider(startX, startZ, wall_depth_x, marginWidth);
+        // 4. 右の壁 (X: -10.0～-9.5, Z: 42.0～45.0)
+        float rightZ = startZ + marginWidth + windowWidth; // 35.0 + 3.0 + 4.0 = 42.0f
+        addCollider(startX, rightZ, wall_depth_x, marginWidth);
+    } // --- (-10, 0, 35) の当たり判定ここまで ---
+
+    // --- (-10, 0, -30) に追加した窓付き壁 (drawWindowWalls) の当たり判定 (AABB) ---
+    { 
+        float wall_height = 3.6f;
+        float wall_width_x = 10.0f; // X軸方向の幅
+        float wall_depth_z = wall_thick; // Z軸方向の奥行き (0.5f)
+
+        const float windowWidthRatio = 0.4f;
+        const float windowHeightRatio = 0.4f;
+        float windowWidth = wall_width_x * windowWidthRatio; // X軸方向の窓の幅 (4.0f)
+        float marginWidth = (wall_width_x - windowWidth) / 2.0f; // X軸方向のマージン (3.0f)
+
+        float startX = -10.0f; // X座標の開始位置
+        float startZ = -30.0f; // Z座標の開始位置
+
+        // 1. 下の壁 (X: -10.0～0.0, Z: -30.0～-29.5)
+        addCollider(startX, startZ, wall_width_x, wall_depth_z);
+        // 2. 上の壁 (X: -10.0～0.0, Z: -30.0～-29.5)
+        addCollider(startX, startZ, wall_width_x, wall_depth_z);
+        // 3. 左の壁 (X: -10.0～-7.0, Z: -30.0～-29.5)
+        addCollider(startX, startZ, marginWidth, wall_depth_z);
+        // 4. 右の壁 (X: -3.0～0.0, Z: -30.0～-29.5)
+        float rightX = startX + marginWidth + windowWidth; // -10.0 + 3.0 + 4.0 = -3.0f
+        addCollider(rightX, startZ, marginWidth, wall_depth_z);
+    } // --- (-10, 0, -30) の当たり判定ここまで ---
+
+    // --- (0, 0, -40) に追加した窓付き壁 (drawWindowWalls) の当たり判定 (AABB) ---
+    { 
+        float wall_height = 3.6f;
+        float wall_width_x = 10.0f; // X軸方向の幅
+        float wall_depth_z = wall_thick; // Z軸方向の奥行き (0.5f)
+
+        const float windowWidthRatio = 0.4f;
+        const float windowHeightRatio = 0.4f;
+        float windowWidth = wall_width_x * windowWidthRatio; // X軸方向の窓の幅 (4.0f)
+        float marginWidth = (wall_width_x - windowWidth) / 2.0f; // X軸方向のマージン (3.0f)
+
+        float startX = 0.0f; // X座標の開始位置
+        float startZ = -40.0f; // Z座標の開始位置
+
+        // 1. 下の壁 (X: 0.0～10.0, Z: -40.0～-39.5)
+        addCollider(startX, startZ, wall_width_x, wall_depth_z);
+        // 2. 上の壁 (X: 0.0～10.0, Z: -40.0～-39.5)
+        addCollider(startX, startZ, wall_width_x, wall_depth_z);
+        // 3. 左の壁 (X: 0.0～3.0, Z: -40.0～-39.5)
+        addCollider(startX, startZ, marginWidth, wall_depth_z);
+        // 4. 右の壁 (X: 7.0～10.0, Z: -40.0～-39.5)
+        float rightX = startX + marginWidth + windowWidth; // 0.0 + 3.0 + 4.0 = 7.0f
+        addCollider(rightX, startZ, marginWidth, wall_depth_z);
+    } // --- (0, 0, -40) の当たり判定ここまで ---
+
+    // ★ 床の端の見えない壁の当たり判定を追加
+    float groundEdge = 50.0f;
+    float boundaryWidth = 100.0f; // -50 to 50
+    // Z = -50 の外側
+    addCollider(-groundEdge, -groundEdge - wall_thick, boundaryWidth, wall_thick);
+    // Z = 50 の外側
+    addCollider(-groundEdge, groundEdge, boundaryWidth, wall_thick);
+    // X = -50 の外側
+    addCollider(-groundEdge - wall_thick, -groundEdge, wall_thick, boundaryWidth);
+    // X = 50 の外側
+    addCollider(groundEdge, -groundEdge, wall_thick, boundaryWidth);
+
 }
+
 
 /**
  * @brief パレットオブジェクトを初期化・配置する
@@ -351,7 +543,7 @@ void display() {
 
     drawAxes();
     drawObjModel(testModel, 0.0f, 0.01f, 0.0f, 0.01f, 0.0f, 0.0f, 0.0f);
-    drawObjModel(blenderModel, -5.0f, 15.0f, -5.0f, 5.0f, 0.0f, 45.0f, 0.0f);
+    drawObjModel(blenderModel, 30.0f, 3.0f, 30.0f, 3.0f, 0.0f, 180.0f, 0.0f);
     for (const auto& pallet : pallets) {
         drawObjModel(paletModel, pallet.x, pallet.visualY, pallet.z, pallet.scale, pallet.rotationX, pallet.rotationY, pallet.rotationZ);
     }
@@ -390,15 +582,19 @@ void updatePallets() {
  * @brief 当たり判定をチェックするためのヘルパー関数
  */
 bool checkCollision(float x, float z) {
-    const float playerWidth = 0.2f;
+    const float playerWidth = 0.2f; // プレイヤーの半径
+    const float playerHeight = spawnY; // プレイヤーのY座標 (カメラの高さ)
 
+    // 壁との当たり判定 (AABB)
     for (const auto& box : wallColliders) {
+        // Y軸 (高さ) のチェックは不要 (窓の当たり判定は AABB で設定済みのため)
         if (x + playerWidth > box.minX && x - playerWidth < box.maxX &&
             z + playerWidth > box.minZ && z - playerWidth < box.maxZ) {
             return true;
         }
     }
 
+    // パレットとの当たり判定 (Y軸回転のみ考慮したOBB)
     for (const auto& pallet : pallets) {
         if (pallet.state != IDLE) {
             float translatedX = x - pallet.x;
@@ -406,8 +602,16 @@ bool checkCollision(float x, float z) {
             float angleRad = -pallet.rotationY * M_PI / 180.0f;
             float localX = translatedX * cos(angleRad) - translatedZ * sin(angleRad);
             float localZ = translatedX * sin(angleRad) + translatedZ * cos(angleRad);
+            
+            float scaledMinY = pallet.localBBox.minY * pallet.scale;
+            float scaledMaxY = pallet.localBBox.maxY * pallet.scale;
+            
+            float localPlayerY = playerHeight - pallet.y; 
+
             if (localX + playerWidth > pallet.localBBox.minX * pallet.scale && localX - playerWidth < pallet.localBBox.maxX * pallet.scale &&
-                localZ + playerWidth > pallet.localBBox.minZ * pallet.scale && localZ - playerWidth < pallet.localBBox.maxZ * pallet.scale) {
+                localZ + playerWidth > pallet.localBBox.minZ * pallet.scale && localZ - playerWidth < pallet.localBBox.maxZ * pallet.scale &&
+                localPlayerY > scaledMinY && localPlayerY < scaledMaxY) // Y軸チェック
+            {
                 return true;
             }
         }
@@ -485,47 +689,82 @@ void keyboard(unsigned char key, int x, int y) {
 void keyboardUp(unsigned char key, int x, int y) { keyStates[tolower(key)] = false; }
 
 /**
- * @brief マウスが動いたときの処理を行うコールバック関数
+ * @brief マウスが動いたときの処理を行うコールバック関数（縦横マウスルック）
+ *
  */
 void mouseMotion(int x, int y) {
-    if (!isMouseLookActive) {
-        return;
-    }
+    if (!isMouseLookActive) return;
 
+    const int centerX = windowWidth / 2;
+    const int centerY = windowHeight / 2;
+
+    // warp によるイベントは無視する（ワープ直後の不正なジャンプ防止）
     if (justWarped) {
         justWarped = false;
+        lastMouseX = centerX;
+        lastMouseY = centerY;
         return;
     }
 
+    // 再フォーカス時に段階的に復元するためのカウンタ（static で保持）
+    static int reentryFrames = 0;
+    const int REENTRY_DURATION = 12; // このフレーム数でフェードインする（増やすとより緩やか）
+
+    // 初回はポインタ位置を基準にして次のイベントから差分を取る（ワープしない）
     if (firstMouse) {
+        firstMouse = false;
         lastMouseX = x;
         lastMouseY = y;
-        firstMouse = false;
+        // ウィンドウに「戻った」直後とみなし、段階的復帰を開始する
+        reentryFrames = REENTRY_DURATION;
         return;
     }
-    
-    float deltaX = (float)(x - lastMouseX);
-    float deltaY = (float)(lastMouseY - y);
 
+    // 前回位置との差分を使う（横と縦）
+    float deltaX = static_cast<float>(x - lastMouseX);      // 右移動で正
+    float deltaY = static_cast<float>(lastMouseY - y);      // Y軸は反転（上移動で正）
+
+    // 異常に大きなジャンプを防ぐためにクランプ（ゆるめに）
+    const float maxDelta = 200.0f;
+    if (deltaX > maxDelta) deltaX = maxDelta;
+    if (deltaX < -maxDelta) deltaX = -maxDelta;
+    if (deltaY > maxDelta) deltaY = maxDelta;
+    if (deltaY < -maxDelta) deltaY = -maxDelta;
+
+    // 再フォーカス直後なら、移動量をフェードイン（段階的に増やす）
+    float fadeFactor = 1.0f;
+    if (reentryFrames > 0) {
+        // 1/Reentry から始まり徐々に 1.0 に到達する（線形）
+        fadeFactor = (float)(REENTRY_DURATION - reentryFrames + 1) / (float)REENTRY_DURATION;
+        reentryFrames--;
+    }
+
+    // カメラ回転の更新（横: yaw, 縦: pitch）にフェード係数を掛ける
+    yaw   += deltaX * mouseSensitivity * fadeFactor;
+    pitch += deltaY * mouseSensitivity * fadeFactor;
+
+    // ピッチのクランプ
+    const float pitchLimit = M_PI_2 - 0.1f;
+    if (pitch > pitchLimit) pitch = pitchLimit;
+    if (pitch < -pitchLimit) pitch = -pitchLimit;
+
+    // yaw を正規化して発散を防ぐ（任意）
+    if (yaw > M_PI) yaw -= 2.0f * M_PI;
+    if (yaw <= -M_PI) yaw += 2.0f * M_PI;
+
+    // 今回のマウス位置を保存
     lastMouseX = x;
     lastMouseY = y;
 
-    yaw += deltaX * mouseSensitivity;
-    pitch += deltaY * mouseSensitivity;
-
-    if (pitch > M_PI_2 - 0.1f) {
-        pitch = M_PI_2 - 0.1f;
-    }
-    if (pitch < -M_PI_2 + 0.1f) {
-        pitch = -M_PI_2 + 0.1f;
-    }
-
-    // ▼▼▼ 端の判定を50pxから10pxに変更 ▼▼▼
-    if (x < 10 || x > windowWidth - 10 || y < 10 || y > windowHeight - 10) {
-        lastMouseX = windowWidth / 2;
-        lastMouseY = windowHeight / 2;
-        glutWarpPointer(lastMouseX, lastMouseY);
+    // ポインタがウィンドウの端に近づいたら中央に補正して次イベントを無視する
+    // ※ 閾値は小さめにしてワープ頻度を抑え、ユーザー体験を穏やかにする
+    const int edgeThreshold = 20; // 小さめの閾値でワープのトリガーを限定
+    if (x < edgeThreshold || x > windowWidth - edgeThreshold ||
+        y < edgeThreshold || y > windowHeight - edgeThreshold) {
+        glutWarpPointer(centerX, centerY);
         justWarped = true;
+        lastMouseX = centerX;
+        lastMouseY = centerY;
     }
 }
 
@@ -587,7 +826,8 @@ int main(int argc, char** argv) {
     glutInit(&argc, argv);
     glutInitDisplayMode(GLUT_DOUBLE | GLUT_RGB | GLUT_DEPTH);
     glutInitWindowSize(windowWidth, windowHeight);
-    glutCreateWindow("3D FPS Controller - Edge Warp Fixed");
+    glutCreateWindow("3D FPS Controller - Original Logic");
+    glutFullScreen();
     initScene();
     glutIgnoreKeyRepeat(1);
     glutDisplayFunc(display);
