@@ -135,7 +135,7 @@ std::vector<Pallet> pallets;
 std::vector<Leaf> fallingLeaves;
 const float treeX = 0.0f, treeY = 0.0f, treeZ = 0.0f;
 const float treeLeafSpawnRadius = 3.0f, treeLeafSpawnHeightOffset = 5.0f;
-const float playerWidth = 0.2f;
+const float playerRadius = 0.2f;
 
 // Vec2のヘルパー関数
 Vec2 operator+(const Vec2& a, const Vec2& b) { return {a.x + b.x, a.z + b.z}; }
@@ -143,6 +143,8 @@ Vec2 operator-(const Vec2& a, const Vec2& b) { return {a.x - b.x, a.z - b.z}; }
 Vec2 operator*(const Vec2& v, float s) { return {v.x * s, v.z * s}; }
 Vec2 operator/(const Vec2& v, float s) { return {v.x / s, v.z / s}; }
 float dot(const Vec2& v1, const Vec2& v2) { return v1.x * v2.x + v1.z * v2.z; }
+float lengthSq(const Vec2& v) { return dot(v, v); }
+float length(const Vec2& v) { return std::sqrt(lengthSq(v)); }
 
 // OBBの頂点を計算する関数
 std::vector<Vec2> getOBBVertices(const OBB& obb) {
@@ -442,8 +444,9 @@ void drawWalls() {
     drawWall(10.0f,-41.0f,wall_thick,3.0f,wall_height, 0.0f, 0.0f, 0.0f);
     drawWall(-10.0f,-31.0f,wall_thick,3.0f,wall_height, 0.0f, 0.0f, 0.0f);
     
-    drawWall(-30.0f,2.0f,15.0f,wall_thick,wall_height, 0.0f, -45.0f, 0.0f);
-    drawWall(-40.0f,-2.0f,15.0f,wall_thick,wall_height, 0.0f, -45.0f, 0.0f);
+    // ★★★ 壁の描画を+45度に設定 ★★★
+    drawWall(-30.0f, 2.0f, 15.0f, wall_thick, wall_height, 0.0f, -45.0f, 0.0f);
+    drawWall(-40.0f, -2.0f, 15.0f, wall_thick, wall_height, 0.0f, -45.0f, 0.0f);
 
     drawWindowWallY(-10.0f, 35.0f, 10.0f, wall_thick, wall_height, 0.0f, 0.0f, 0.0f);
     drawWindowWalls(-10.0f, -30.0f, 10.0f, wall_thick, wall_height, 0.0f, 0.0f, 0.0f);
@@ -637,15 +640,24 @@ void drawColliders() {
             glVertex3f(vertices[3].x, 0.01f, vertices[3].z); glVertex3f(vertices[3].x, wall_height, vertices[3].z);
         glEnd();
     }
+    
+    // プレイヤーの円形当たり判定をシアンで描画
+    glColor3f(0.0f, 1.0f, 1.0f);
+    glPushMatrix();
+    glTranslatef(cameraX, 0.01f, cameraZ);
+    glBegin(GL_LINE_LOOP);
+    for(int i=0; i<360; i++) {
+        float degInRad = i*M_PI/180;
+        glVertex3f(cos(degInRad)*playerRadius, 0.0f, sin(degInRad)*playerRadius);
+    }
+    glEnd();
+    glPopMatrix();
+
 
     glLineWidth(1.0f);
     glEnable(GL_TEXTURE_2D);
     glEnable(GL_LIGHTING);
 }
-
-// =======================================================================
-// ★★★ ここから修正箇所 ★★★
-// =======================================================================
 
 void setupColliders() {
     wallColliders.clear();
@@ -667,8 +679,7 @@ void setupColliders() {
     addCollider(10.0f,-41.0f,wall_thick,3.0f); 
     addCollider(-10.0f,-31.0f,wall_thick,3.0f); 
 
-    // OBBとして-45度回転した壁を当たり判定リストに正しく追加
-    // 描画が-45度なので、当たり判定の計算では+45度を使う
+    // ★★★ 当たり判定の角度を+45度に変更 ★★★
     float angle_rad = 45.0f * M_PI / 180.0f;
     float w = 15.0f;
     float d = wall_thick;
@@ -881,15 +892,33 @@ bool checkAABBCollision(float newX, float newZ, float& correctionX, float& corre
     correctionZ = 0.0f;
 
     for (const auto& box : wallColliders) {
-        float overlapX = std::max(0.0f, std::min(newX + playerWidth, box.maxX) - std::max(newX - playerWidth, box.minX));
-        float overlapZ = std::max(0.0f, std::min(newZ + playerWidth, box.maxZ) - std::max(newZ - playerWidth, box.minZ));
+        float closestX = std::max(box.minX, std::min(newX, box.maxX));
+        float closestZ = std::max(box.minZ, std::min(newZ, box.maxZ));
 
-        if (overlapX > 0 && overlapZ > 0) {
-            printf("[DEBUG] Collision with AABB! Player at (%.2f, %.2f)\n", newX, newZ);
-            if (overlapX < overlapZ) {
-                correctionX = (newX < (box.minX + box.maxX) / 2.0f) ? -overlapX : overlapX;
+        float dx = newX - closestX;
+        float dz = newZ - closestZ;
+        float distSq = (dx * dx) + (dz * dz);
+
+        if (distSq < (playerRadius * playerRadius)) {
+            float dist = sqrt(distSq);
+            float overlap = playerRadius - dist;
+            if (dist > 0) {
+                correctionX = (dx / dist) * overlap;
+                correctionZ = (dz / dist) * overlap;
             } else {
-                correctionZ = (newZ < (box.minZ + box.maxZ) / 2.0f) ? -overlapZ : overlapZ;
+                float overlapX1 = newX - box.minX;
+                float overlapX2 = box.maxX - newX;
+                float overlapZ1 = newZ - box.minZ;
+                float overlapZ2 = box.maxZ - newZ;
+
+                float minOverlapX = std::min(overlapX1, overlapX2);
+                float minOverlapZ = std::min(overlapZ1, overlapZ2);
+
+                if (minOverlapX < minOverlapZ) {
+                    correctionX = (overlapX1 < overlapX2) ? -minOverlapX : minOverlapX;
+                } else {
+                    correctionZ = (overlapZ1 < overlapZ2) ? -minOverlapZ : minOverlapZ;
+                }
             }
             return true;
         }
@@ -900,60 +929,49 @@ bool checkAABBCollision(float newX, float newZ, float& correctionX, float& corre
 bool checkOBBCollision(float newX, float newZ, float& correctionX, float& correctionZ) {
     correctionX = 0.0f;
     correctionZ = 0.0f;
-    
-    std::vector<Vec2> playerVertices = {
-        {newX - playerWidth, newZ - playerWidth},
-        {newX + playerWidth, newZ - playerWidth},
-        {newX + playerWidth, newZ + playerWidth},
-        {newX - playerWidth, newZ + playerWidth}
-    };
-    std::vector<Vec2> playerAxes = {{1, 0}, {0, 1}};
 
     for (const auto& obb : obbColliders) {
-        std::vector<Vec2> obbVertices = getOBBVertices(obb);
+        float cosA_neg = cosf(-obb.angle);
+        float sinA_neg = sinf(-obb.angle);
+        float dx = newX - obb.cx;
+        float dz = newZ - obb.cz;
+        float localPlayerX = dx * cosA_neg - dz * sinA_neg;
+        float localPlayerZ = dx * sinA_neg + dz * cosA_neg;
+
+        float closestX = std::max(-obb.halfWidth, std::min(localPlayerX, obb.halfWidth));
+        float closestZ = std::max(-obb.halfDepth, std::min(localPlayerZ, obb.halfDepth));
         
-        float cosA = cosf(obb.angle);
-        float sinA = sinf(obb.angle);
-        std::vector<Vec2> obbAxes = { {cosA, sinA}, {-sinA, cosA} };
+        Vec2 localPlayerPos = {localPlayerX, localPlayerZ};
+        Vec2 closestPoint = {closestX, closestZ};
+        Vec2 delta = localPlayerPos - closestPoint;
 
-        std::vector<Vec2> axes = playerAxes;
-        axes.insert(axes.end(), obbAxes.begin(), obbAxes.end());
-
-        float minOverlap = std::numeric_limits<float>::max();
-        Vec2 mtvAxis = {0, 0};
-        
-        bool separated = false;
-        for (const auto& axis : axes) {
-            float playerMin, playerMax, obbMin, obbMax;
-            projectPolygon(playerVertices, axis, playerMin, playerMax);
-            projectPolygon(obbVertices, axis, obbMin, obbMax);
-
-            if (playerMax < obbMin || obbMax < playerMin) {
-                separated = true;
-                break;
+        if (lengthSq(delta) < (playerRadius * playerRadius)) {
+            float dist = length(delta);
+            float overlap = playerRadius - dist;
+            
+            Vec2 localCorrection = {0, 0};
+            if (dist > 0) {
+                localCorrection = delta * (overlap / dist);
             } else {
-                float overlap = std::min(playerMax, obbMax) - std::max(playerMin, obbMin);
-                if (overlap < minOverlap) {
-                    minOverlap = overlap;
-                    mtvAxis = axis;
+                float dx_edge = obb.halfWidth - std::abs(localPlayerX);
+                float dz_edge = obb.halfDepth - std::abs(localPlayerZ);
+                if (dx_edge < dz_edge) {
+                    localCorrection.x = (localPlayerX > 0) ? dx_edge : -dx_edge;
+                } else {
+                    localCorrection.z = (localPlayerZ > 0) ? dz_edge : -dz_edge;
                 }
             }
-        }
 
-        if (!separated) {
-            printf("[DEBUG] OBB Collision DETECTED! Player(%.2f, %.2f) vs OBB_Center(%.2f, %.2f)\n", newX, newZ, obb.cx, obb.cz);
-            Vec2 centerToCenter = {obb.cx - newX, obb.cz - newZ};
-            if (dot(centerToCenter, mtvAxis) < 0) {
-                mtvAxis = mtvAxis * -1.0f;
-            }
-            correctionX = mtvAxis.x * minOverlap;
-            correctionZ = mtvAxis.z * minOverlap;
-            printf("[DEBUG] Collision response TRIGGERED. Correction: (%.4f, %.4f)\n", correctionX, correctionZ);
+            float cosA = cosf(obb.angle);
+            float sinA = sinf(obb.angle);
+            correctionX = localCorrection.x * cosA - localCorrection.z * sinA;
+            correctionZ = localCorrection.x * sinA + localCorrection.z * cosA;
             return true;
         }
     }
     return false;
 }
+
 
 void update(int value) {
     float deltaTime = 1.0f / 60.0f;
