@@ -1,4 +1,5 @@
 #include <GL/glut.h>
+#include <GL/glu.h>
 #define _USE_MATH_DEFINES
 #include <cmath>
 #include <vector>
@@ -8,9 +9,55 @@
 #include <iostream>
 #include <string>
 #include <locale.h>
+#include <random>
+#include <algorithm>
+#include <numeric>
+#include <limits>
 
 #define TINYOBJLOADER_IMPLEMENTATION
 #include "tiny_obj_loader.h"
+
+// 乱数生成器
+std::mt19937 rng(std::random_device{}());
+
+// Perlin Noise用のヘルパー関数
+float fade(float t) { return t * t * t * (t * (t * 6 - 15) + 10); }
+float linearInterpolate(float a, float b, float t) { return a + t * (b - a); }
+float grad(int hash, float x, float y, float z) {
+    int h = hash & 15;
+    float u = h < 8 ? x : y;
+    float v = h < 4 ? y : (h == 12 || h == 14 ? x : z);
+    return ((h & 1) == 0 ? u : -u) + ((h & 2) == 0 ? v : -v);
+}
+int p[512]; // Permutation table
+
+void initPerlinNoise() {
+    std::iota(p, p + 256, 0);
+    std::shuffle(p, p + 256, rng);
+    for (int i = 0; i < 256; ++i) {
+        p[i + 256] = p[i];
+    }
+}
+
+float perlinNoise(float x, float y, float z) {
+    int X = (int)floor(x) & 255;
+    int Y = (int)floor(y) & 255;
+    int Z = (int)floor(z) & 255;
+    x -= floor(x);
+    y -= floor(y);
+    z -= floor(z);
+    float u = fade(x), v = fade(y), w = fade(z);
+    int A = p[X] + Y, AA = p[A] + Z, AB = p[A + 1] + Z;
+    int B = p[X + 1] + Y, BA = p[B] + Z, BB = p[B + 1] + Z;
+    float res = linearInterpolate(
+        linearInterpolate(
+            linearInterpolate(grad(p[AA], x, y, z), grad(p[BA], x - 1, y, z), u),
+            linearInterpolate(grad(p[AB], x, y - 1, z), grad(p[BB], x - 1, y - 1, z), u), v),
+        linearInterpolate(
+            linearInterpolate(grad(p[AA + 1], x, y, z - 1), grad(p[BA + 1], x - 1, y, z - 1), u),
+            linearInterpolate(grad(p[AB + 1], x, y - 1, z - 1), grad(p[BB + 1], x - 1, y - 1, z - 1), u), v), w);
+    return (res + 1.0f) / 2.0f;
+}
 
 // モデルデータをまとめて管理するための構造体
 struct Model {
@@ -25,24 +72,43 @@ struct BoundingBox {
     float minX, maxX, minY, maxY, minZ, maxZ;
 };
 
-// パレットの状態を管理するためのenum
-enum PalletState {
-    IDLE,    // 通常時
-    TIPPING, // 転倒アニメーション中
-    TIPPED   // 転倒済み
+// 2Dベクトル用の構造体
+struct Vec2 {
+    float x, z;
 };
+
+// 回転を考慮した当たり判定用の構造体 (OBB)
+struct OBB {
+    float cx, cz;
+    float halfWidth, halfDepth;
+    float angle;
+};
+
+// パレットの状態を管理するためのenum
+enum PalletState { IDLE, TIPPING, TIPPED };
 
 // パレットの情報を管理する構造体
 struct Pallet {
     float x, y, z;
-    float rotationX = 0.0f;
-    float rotationY = 0.0f;
-    float rotationZ = 0.0f;
+    float rotationX = 0.0f, rotationY = 0.0f, rotationZ = 0.0f;
     char interactionAxis = 'y';
     BoundingBox localBBox;
     PalletState state = IDLE;
     float visualY = 0.0f;
     float scale = 0.15f;
+};
+
+// 落ちる葉っぱの構造体
+struct Leaf {
+    float x, y, z;
+    float vx, vy, vz;
+    float rotationAngleX, rotationAngleY, rotationAngleZ;
+    float rotationSpeedX, rotationSpeedY, rotationSpeedZ;
+    float scale;
+    float lifeTime;
+    float maxLifeTime;
+    GLfloat color[4];
+    GLuint textureID;
 };
 
 // --- 変数定義 ---
@@ -58,24 +124,58 @@ int windowWidth = 1600, windowHeight = 900;
 bool keyStates[256] = {false};
 bool justWarped = false;
 bool isMouseLookActive = true;
+bool showColliders = false;
 
-GLuint groundTextureID;
-GLuint wallTextureID;
-
+GLuint groundTextureID, wallTextureID, leafTextureID, rockTextureID;
 float g_time = 0.0f;
-
-Model testModel;
-Model paletModel;
-Model blenderModel;
-
-std::vector<BoundingBox> wallColliders; // AABB (回転しない壁)
+Model paletModel, blenderModel;
+std::vector<BoundingBox> wallColliders;
+std::vector<OBB> obbColliders;
 std::vector<Pallet> pallets;
+std::vector<Leaf> fallingLeaves;
+const float treeX = 0.0f, treeY = 0.0f, treeZ = 0.0f;
+const float treeLeafSpawnRadius = 3.0f, treeLeafSpawnHeightOffset = 5.0f;
+const float playerWidth = 0.2f;
 
-// --- 関数定義 ---
+// Vec2のヘルパー関数
+Vec2 operator+(const Vec2& a, const Vec2& b) { return {a.x + b.x, a.z + b.z}; }
+Vec2 operator-(const Vec2& a, const Vec2& b) { return {a.x - b.x, a.z - b.z}; }
+Vec2 operator*(const Vec2& v, float s) { return {v.x * s, v.z * s}; }
+Vec2 operator/(const Vec2& v, float s) { return {v.x / s, v.z / s}; }
+float dot(const Vec2& v1, const Vec2& v2) { return v1.x * v2.x + v1.z * v2.z; }
 
-/**
- * @brief モデルの頂点データからバウンディングボックスを計算する
- */
+// OBBの頂点を計算する関数
+std::vector<Vec2> getOBBVertices(const OBB& obb) {
+    std::vector<Vec2> vertices(4);
+    float cosA = cosf(obb.angle);
+    float sinA = sinf(obb.angle);
+    Vec2 center = {obb.cx, obb.cz};
+
+    Vec2 axisX = {cosA, sinA};
+    Vec2 axisZ = {-sinA, cosA};
+    Vec2 halfVecX = axisX * obb.halfWidth;
+    Vec2 halfVecZ = axisZ * obb.halfDepth;
+
+    vertices[0] = center - halfVecX - halfVecZ;
+    vertices[1] = center + halfVecX - halfVecZ;
+    vertices[2] = center + halfVecX + halfVecZ;
+    vertices[3] = center - halfVecX + halfVecZ;
+
+    return vertices;
+}
+
+// プロジェクションを計算するヘルパー関数
+void projectPolygon(const std::vector<Vec2>& vertices, const Vec2& axis, float& min, float& max) {
+    min = std::numeric_limits<float>::max();
+    max = std::numeric_limits<float>::lowest();
+    for (const auto& v : vertices) {
+        float p = dot(v, axis);
+        if (p < min) min = p;
+        if (p > max) max = p;
+    }
+}
+
+// --- 関数定義 (描画関連など変更なしの部分は省略) ---
 BoundingBox calculateModelBBox(const Model& model) {
     if (model.attrib.vertices.empty()) { return {0,0,0,0,0,0}; }
     float minX = model.attrib.vertices[0], maxX = model.attrib.vertices[0];
@@ -92,9 +192,6 @@ BoundingBox calculateModelBBox(const Model& model) {
     return {minX, maxX, minY, maxY, minZ, maxZ};
 }
 
-/**
- * @brief tinyobjloaderを使い、.objと.mtlファイルを読み込んでModel構造体に格納する
- */
 bool loadObjModel(Model& model, const std::string& filepath) {
     std::string warn, err;
     std::string base_dir = filepath.substr(0, filepath.find_last_of("/\\") + 1);
@@ -105,9 +202,6 @@ bool loadObjModel(Model& model, const std::string& filepath) {
     return model.loaded;
 }
 
-/**
- * @brief .objファイルから読み込んだモデルを描画する
- */
 void drawObjModel(const Model& model, float x, float y, float z, float scale, float rx, float ry, float rz) {
     if (!model.loaded) return;
     glDisable(GL_TEXTURE_2D);
@@ -146,11 +240,8 @@ void drawObjModel(const Model& model, float x, float y, float z, float scale, fl
     glEnable(GL_TEXTURE_2D);
 }
 
-/**
- * @brief OpenCVで画像ファイルを読み込む関数
- */
-bool loadTexture(const char* filename, GLuint& textureID) {
-    cv::Mat image = cv::imread(filename);
+bool loadTexture(const char* filename, GLuint& textureID, bool alpha = false) {
+    cv::Mat image = cv::imread(filename, alpha ? cv::IMREAD_UNCHANGED : cv::IMREAD_COLOR);
     if (image.empty()) {
         printf("Error: Image not found: %s\n", filename);
         return false;
@@ -160,27 +251,27 @@ bool loadTexture(const char* filename, GLuint& textureID) {
     glGenTextures(1, &textureID);
     glBindTexture(GL_TEXTURE_2D, textureID);
     glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
-    glTexImage2D(GL_TEXTURE_2D, 0, 3, image.cols, image.rows, 0, GL_BGR, GL_UNSIGNED_BYTE, image.data);
+    
+    if (alpha) {
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, image.cols, image.rows, 0, GL_BGRA, GL_UNSIGNED_BYTE, image.data);
+    } else {
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB, image.cols, image.rows, 0, GL_BGR, GL_UNSIGNED_BYTE, image.data);
+    }
+
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_REPEAT);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_REPEAT);
     
-    printf("Successfully loaded texture: %s\n", filename);
+    printf("Successfully loaded texture: %s (alpha: %s)\n", filename, alpha ? "true" : "false");
     return true;
 }
 
-/**
- * @brief 3D空間にビットマップフォントの文字列を描画する
- */
 void renderBitmapString(float x, float y, float z, void* font, const char* string) {
     glRasterPos3f(x, y, z);
     for (const char* c = string; *c != '\0'; c++) { glutBitmapCharacter(font, *c); }
 }
 
-/**
- * @brief ワールドの原点にXYZ座標軸を描画する
- */
 void drawAxes() {
     glDisable(GL_LIGHTING); glDisable(GL_TEXTURE_2D); glLineWidth(3.0f);
     glColor3f(1.0f, 0.0f, 0.0f); glBegin(GL_LINES); glVertex3f(0.0f, 0.1f, 0.0f); glVertex3f(10.0f, 0.1f, 0.0f); glEnd();
@@ -192,9 +283,6 @@ void drawAxes() {
     glLineWidth(1.0f); glEnable(GL_TEXTURE_2D); glEnable(GL_LIGHTING);
 }
 
-/**
- * @brief 画面にデバッグ情報などのHUD（2D情報）を描画する
- */
 void drawHUD() {
     glDisable(GL_LIGHTING); glDisable(GL_TEXTURE_2D); glDisable(GL_DEPTH_TEST);
     glMatrixMode(GL_PROJECTION); glPushMatrix(); glLoadIdentity(); gluOrtho2D(0.0, windowWidth, 0.0, windowHeight);
@@ -205,9 +293,6 @@ void drawHUD() {
     glMatrixMode(GL_MODELVIEW); glEnable(GL_DEPTH_TEST); glEnable(GL_TEXTURE_2D); glEnable(GL_LIGHTING);
 }
 
-/**
- * @brief テクスチャ付きの地面を描画する
- */
 void drawGround() {
     GLfloat ground_mat[] = {1.0f, 1.0f, 1.0f, 1.0f};
     glMaterialfv(GL_FRONT, GL_AMBIENT_AND_DIFFUSE, ground_mat);
@@ -222,9 +307,6 @@ void drawGround() {
     glEnd();
 }
 
-/**
- * @brief テクスチャ付きの壁を描画する
- */
 void drawWalls() {
     GLfloat wall_mat[] = {1.0f, 1.0f, 1.0f, 1.0f};
     glMaterialfv(GL_FRONT, GL_AMBIENT_AND_DIFFUSE, wall_mat);
@@ -236,41 +318,33 @@ void drawWalls() {
         float texX = width * texRepeatScale;
         float texY = height * texRepeatScale;
         float texZ = depth * texRepeatScale;
-        
         glColor3f(1.0f, 1.0f, 1.0f);
-
         glBegin(GL_QUADS);
-        // Front Face
         glNormal3f(0.0, 0.0, 1.0);
         glTexCoord2f(0.0f, 0.0f); glVertex3f(-0.5f, -0.5f, 0.5f);
         glTexCoord2f(texX, 0.0f); glVertex3f(0.5f, -0.5f, 0.5f);
         glTexCoord2f(texX, texY); glVertex3f(0.5f, 0.5f, 0.5f);
         glTexCoord2f(0.0f, texY); glVertex3f(-0.5f, 0.5f, 0.5f);
-        // Back Face
         glNormal3f(0.0, 0.0, -1.0);
         glTexCoord2f(texX, 0.0f); glVertex3f(-0.5f, -0.5f, -0.5f);
         glTexCoord2f(texX, texY); glVertex3f(-0.5f, 0.5f, -0.5f);
         glTexCoord2f(0.0f, texY); glVertex3f(0.5f, 0.5f, -0.5f);
         glTexCoord2f(0.0f, 0.0f); glVertex3f(0.5f, -0.5f, -0.5f);
-        // Top Face
         glNormal3f(0.0, 1.0, 0.0);
         glTexCoord2f(0.0f, texZ); glVertex3f(-0.5f, 0.5f, -0.5f);
         glTexCoord2f(0.0f, 0.0f); glVertex3f(-0.5f, 0.5f, 0.5f);
         glTexCoord2f(texX, 0.0f); glVertex3f(0.5f, 0.5f, 0.5f);
         glTexCoord2f(texX, texZ); glVertex3f(0.5f, 0.5f, -0.5f);
-        // Bottom Face
         glNormal3f(0.0, -1.0, 0.0);
         glTexCoord2f(texX, texZ); glVertex3f(-0.5f, -0.5f, -0.5f);
         glTexCoord2f(0.0f, texZ); glVertex3f(0.5f, -0.5f, -0.5f);
         glTexCoord2f(0.0f, 0.0f); glVertex3f(0.5f, -0.5f, 0.5f);
         glTexCoord2f(texX, 0.0f); glVertex3f(-0.5f, -0.5f, 0.5f);
-        // Right face
         glNormal3f(1.0, 0.0, 0.0);
         glTexCoord2f(texZ, 0.0f); glVertex3f(0.5f, -0.5f, -0.5f);
         glTexCoord2f(texZ, texY); glVertex3f(0.5f, 0.5f, -0.5f);
         glTexCoord2f(0.0f, texY); glVertex3f(0.5f, 0.5f, 0.5f);
         glTexCoord2f(0.0f, 0.0f); glVertex3f(0.5f, -0.5f, 0.5f);
-        // Left Face
         glNormal3f(-1.0, 0.0, 0.0);
         glTexCoord2f(0.0f, 0.0f); glVertex3f(-0.5f, -0.5f, -0.5f);
         glTexCoord2f(texZ, 0.0f); glVertex3f(-0.5f, -0.5f, 0.5f);
@@ -279,45 +353,32 @@ void drawWalls() {
         glEnd();
     };
 
-    // (x, y, z) を左下隅の座標として、(width, height, depth) の壁を描画するヘルパー
-    // (X軸方向に width, Z軸方向に depth を持つ)
     auto drawWallSegment = [&](float x, float y, float z, float width, float depth, float height, float rx, float ry, float rz) {
         glPushMatrix();
-        // 中心座標 (x + width/2, y + height/2, z + depth/2) に移動
         glTranslatef(x + width / 2.0f, y + height / 2.0f, z + depth / 2.0f);
-        
-        glRotatef(ry, 0.0f, 1.0f, 0.0f); // Y軸回転
-        glRotatef(rx, 1.0f, 0.0f, 0.0f); // X軸回転
-        glRotatef(rz, 0.0f, 0.0f, 1.0f); // Z軸回転
-
+        glRotatef(ry, 0.0f, 1.0f, 0.0f);
+        glRotatef(rx, 1.0f, 0.0f, 0.0f);
+        glRotatef(rz, 0.0f, 0.0f, 1.0f);
         glScalef(width, height, depth);
         drawTexturedCube(width, height, depth);
         glPopMatrix();
     };
 
-    // (Z軸方向に width, X軸方向に depth を持つ) 壁を描画するヘルパー
     auto drawWallSegmentY = [&](float x, float y, float z, float width, float depth, float height, float rx, float ry, float rz) {
         glPushMatrix();
-        // 中心座標 (x + depth/2, y + height/2, z + width/2) に移動
         glTranslatef(x + depth / 2.0f, y + height / 2.0f, z + width / 2.0f);
-        
-        glRotatef(ry, 0.0f, 1.0f, 0.0f); // Y軸回転
-        glRotatef(rx, 1.0f, 0.0f, 0.0f); // X軸回転
-        glRotatef(rz, 0.0f, 0.0f, 1.0f); // Z軸回転
-
-        // スケールを (depth, height, width) にする
+        glRotatef(ry, 0.0f, 1.0f, 0.0f);
+        glRotatef(rx, 1.0f, 0.0f, 0.0f);
+        glRotatef(rz, 0.0f, 0.0f, 1.0f);
         glScalef(depth, height, width);
         drawTexturedCube(depth, height, width);
         glPopMatrix();
     };
 
-
-    // 既存の drawWall の定義 (X軸方向に伸びる)
     auto drawWall = [&](float x, float z, float width, float depth, float height, float rx, float ry, float rz) {
         drawWallSegment(x, 0.0f, z, width, depth, height, rx, ry, rz);
     };
 
-    // 窓付きの壁を描画する関数 (X軸方向に伸びる)
     auto drawWindowWalls = [&](float x, float z, float width, float depth, float height, float rx, float ry, float rz) {
         const float windowWidthRatio = 0.4f;
         const float windowHeightRatio = 0.4f;
@@ -326,35 +387,30 @@ void drawWalls() {
         float marginWidth = (width - windowWidth) / 2.0f;
         float marginHeight = (height - windowHeight) / 2.0f;
 
-        drawWallSegment(x, 0.0f, z, width, depth, marginHeight, rx, ry, rz); // 下の壁
+        drawWallSegment(x, 0.0f, z, width, depth, marginHeight, rx, ry, rz);
         float topY = marginHeight + windowHeight;
-        drawWallSegment(x, topY, z, width, depth, marginHeight, rx, ry, rz); // 上の壁
-        drawWallSegment(x, marginHeight, z, marginWidth, depth, windowHeight, rx, ry, rz); // 左の壁
+        drawWallSegment(x, topY, z, width, depth, marginHeight, rx, ry, rz);
+        drawWallSegment(x, marginHeight, z, marginWidth, depth, windowHeight, rx, ry, rz);
         float rightX = x + marginWidth + windowWidth;
-        drawWallSegment(rightX, marginHeight, z, marginWidth, depth, windowHeight, rx, ry, rz); // 右の壁
+        drawWallSegment(rightX, marginHeight, z, marginWidth, depth, windowHeight, rx, ry, rz);
     };
 
-    // 新設: 窓付きの壁を描画する関数 (Z軸方向に伸びる)
     auto drawWindowWallY = [&](float x, float z, float width, float depth, float height, float rx, float ry, float rz) {
         const float windowWidthRatio = 0.4f;
         const float windowHeightRatio = 0.4f;
-        float windowWidth = width * windowWidthRatio; // Z軸方向の窓の幅
-        float windowHeight = height * windowHeightRatio; // Y軸方向の窓の高さ
-        float marginWidth = (width - windowWidth) / 2.0f; // Z軸方向のマージン
-        float marginHeight = (height - windowHeight) / 2.0f; // Y軸方向のマージン
+        float windowWidth = width * windowWidthRatio;
+        float windowHeight = height * windowHeightRatio;
+        float marginWidth = (width - windowWidth) / 2.0f;
+        float marginHeight = (height - windowHeight) / 2.0f;
 
-        // drawWallSegmentY を使用 (width がZ軸方向, depth がX軸方向)
-        drawWallSegmentY(x, 0.0f, z, width, depth, marginHeight, rx, ry, rz); // 下の壁
+        drawWallSegmentY(x, 0.0f, z, width, depth, marginHeight, rx, ry, rz);
         float topY = marginHeight + windowHeight;
-        drawWallSegmentY(x, topY, z, width, depth, marginHeight, rx, ry, rz); // 上の壁
-        
-        drawWallSegmentY(x, marginHeight, z, marginWidth, depth, windowHeight, rx, ry, rz); // 左の壁 (Z軸基準)
+        drawWallSegmentY(x, topY, z, width, depth, marginHeight, rx, ry, rz);
+        drawWallSegmentY(x, marginHeight, z, marginWidth, depth, windowHeight, rx, ry, rz);
         float rightZ = z + marginWidth + windowWidth;
-        drawWallSegmentY(x, marginHeight, rightZ, marginWidth, depth, windowHeight, rx, ry, rz); // 右の壁 (Z軸基準)
+        drawWallSegmentY(x, marginHeight, rightZ, marginWidth, depth, windowHeight, rx, ry, rz);
     };
 
-
-    // 中央に仕切りがある壁を描画する関数 (X軸方向に伸びる)
     auto drawDividedWall = [&](float x, float z, float width, float depth, float height, float rx, float ry, float rz) {
         const float dividerThickness = 0.5f; 
         float sideWallWidth = (width - dividerThickness) / 2.0f;
@@ -364,7 +420,6 @@ void drawWalls() {
         float rightWallX = dividerX + dividerThickness;
         drawWallSegment(rightWallX, 0.0f, z, sideWallWidth, depth, height, rx, ry, rz); 
     };
-
 
     float wall_height = 3.6f, wall_thick = 0.5f;
     
@@ -384,134 +439,294 @@ void drawWalls() {
     drawWall(-20.0f,40.0f,5.0f,wall_thick,wall_height, 0.0f, 0.0f, 0.0f);
     drawWall(-45.0f,40.0f,20.0f,wall_thick,wall_height, 0.0f, 0.0f, 0.0f);
     drawWall(-45.0f,45.0f,30.0f,wall_thick,wall_height, 0.0f, 0.0f, 0.0f);
-    drawWall(10.0f,-41.0f,wall_thick,3.0f,wall_height, 0.0f, 0.0f, 0.0f);//追加
-    drawWall(-10.0f,-31.0f,wall_thick,3.0f,wall_height, 0.0f, 0.0f, 0.0f);//追加
+    drawWall(10.0f,-41.0f,wall_thick,3.0f,wall_height, 0.0f, 0.0f, 0.0f);
+    drawWall(-10.0f,-31.0f,wall_thick,3.0f,wall_height, 0.0f, 0.0f, 0.0f);
+    
+    drawWall(-30.0f,2.0f,15.0f,wall_thick,wall_height, 0.0f, -45.0f, 0.0f);
+    drawWall(-40.0f,-2.0f,15.0f,wall_thick,wall_height, 0.0f, -45.0f, 0.0f);
 
-    // ★ (-10, 0, 35) に Z軸方向に伸びる窓付きの壁を追加
     drawWindowWallY(-10.0f, 35.0f, 10.0f, wall_thick, wall_height, 0.0f, 0.0f, 0.0f);
-
-    // ★ (-10, 0, -30) に X軸方向に伸びる窓付きの壁を追加
     drawWindowWalls(-10.0f, -30.0f, 10.0f, wall_thick, wall_height, 0.0f, 0.0f, 0.0f);
-
-    // ★ (0, 0, -40) に X軸方向に伸びる窓付きの壁を追加
     drawWindowWalls(0.0f, -40.0f, 10.0f, wall_thick, wall_height, 0.0f, 0.0f, 0.0f);
 }
 
-/**
- * @brief 壁の当たり判定情報を生成する
- */
+void drawCylinder(float radius, float height, int sides, float baseHeight = 0.0f) {
+    glBegin(GL_QUAD_STRIP);
+    for (int i = 0; i <= sides; i++) {
+        float angle = 2.0f * M_PI * i / sides;
+        float x = cos(angle);
+        float z = sin(angle);
+        glNormal3f(x, 0.0f, z);
+        glVertex3f(x * radius, baseHeight + height, z * radius);
+        glVertex3f(x * radius, baseHeight, z * radius);
+    }
+    glEnd();
+
+    glBegin(GL_TRIANGLE_FAN);
+    glNormal3f(0.0f, 1.0f, 0.0f);
+    glVertex3f(0.0f, baseHeight + height, 0.0f);
+    for (int i = 0; i <= sides; i++) {
+        float angle = 2.0f * M_PI * i / sides;
+        glVertex3f(cos(angle) * radius, baseHeight + height, sin(angle) * radius);
+    }
+    glEnd();
+
+    glBegin(GL_TRIANGLE_FAN);
+    glNormal3f(0.0f, -1.0f, 0.0f);
+    glVertex3f(0.0f, baseHeight, 0.0f);
+    for (int i = sides; i >= 0; i--) {
+        float angle = 2.0f * M_PI * i / sides;
+        glVertex3f(cos(angle) * radius, baseHeight, sin(angle) * radius);
+    }
+    glEnd();
+}
+
+void drawTree() {
+    glDisable(GL_TEXTURE_2D);
+
+    glPushMatrix();
+    glTranslatef(treeX, treeY, treeZ);
+
+    GLfloat trunk_mat[] = {0.5f, 0.3f, 0.1f, 1.0f};
+    glMaterialfv(GL_FRONT, GL_AMBIENT_AND_DIFFUSE, trunk_mat);
+    drawCylinder(0.8f, 5.0f, 20, 0.0f);
+
+    GLfloat leaves_mat[] = {0.0f, 0.7f, 0.2f, 1.0f};
+    glMaterialfv(GL_FRONT, GL_AMBIENT_AND_DIFFUSE, leaves_mat);
+
+    glPushMatrix();
+        glTranslatef(0.0f, 5.0f, 0.0f);
+        glRotatef(-90.0f, 1.0f, 0.0f, 0.0f);
+        glutSolidCone(3.0f, 4.0f, 20, 10);
+    glPopMatrix();
+
+    glPushMatrix();
+        glTranslatef(0.0f, 7.0f, 0.0f);
+        glRotatef(-90.0f, 1.0f, 0.0f, 0.0f);
+        glutSolidCone(2.5f, 3.5f, 20, 10);
+    glPopMatrix();
+    
+    glPushMatrix();
+        glTranslatef(0.0f, 9.0f, 0.0f);
+        glRotatef(-90.0f, 1.0f, 0.0f, 0.0f);
+        glutSolidCone(2.0f, 3.0f, 20, 10);
+    glPopMatrix();
+
+    glPopMatrix();
+    glEnable(GL_TEXTURE_2D);
+}
+
+void drawFallingLeaves() {
+    glDisable(GL_LIGHTING);
+    glEnable(GL_BLEND);
+    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+    glAlphaFunc(GL_GREATER, 0.01f);
+    glEnable(GL_ALPHA_TEST);
+
+    glEnable(GL_TEXTURE_2D);
+    glBindTexture(GL_TEXTURE_2D, leafTextureID);
+
+    for (const auto& leaf : fallingLeaves) {
+        glColor4fv(leaf.color);
+        glPushMatrix();
+        glTranslatef(leaf.x, leaf.y, leaf.z);
+        
+        GLfloat modelview[16];
+        glGetFloatv(GL_MODELVIEW_MATRIX, modelview);
+        glRotatef(atan2(modelview[0], modelview[2]) * 180.0f / M_PI, 0.0f, 1.0f, 0.0f);
+        
+        glRotatef(leaf.rotationAngleX, 1.0f, 0.0f, 0.0f);
+        glRotatef(leaf.rotationAngleY, 0.0f, 1.0f, 0.0f);
+        glRotatef(leaf.rotationAngleZ, 0.0f, 0.0f, 1.0f);
+
+        float halfSize = leaf.scale / 2.0f;
+        
+        glBegin(GL_QUADS);
+            glNormal3f(0.0f, 0.0f, 1.0f);
+
+            glTexCoord2f(0.0f, 0.0f); 
+            glVertex3f(-halfSize, -halfSize, 0.0f);
+
+            glTexCoord2f(1.0f, 0.0f); 
+            glVertex3f( halfSize, -halfSize, 0.0f);
+
+            glTexCoord2f(1.0f, 1.0f); 
+            glVertex3f( halfSize * 0.7f,  halfSize, 0.0f);
+
+            glTexCoord2f(0.0f, 1.0f); 
+            glVertex3f(-halfSize * 0.7f,  halfSize, 0.0f);
+        glEnd();
+        glPopMatrix();
+    }
+
+    glDisable(GL_ALPHA_TEST);
+    glDisable(GL_BLEND);
+    glDisable(GL_TEXTURE_2D);
+    glEnable(GL_LIGHTING);
+}
+
+void drawRock(float x, float y, float z, float radius) {
+    glEnable(GL_TEXTURE_2D);
+    glBindTexture(GL_TEXTURE_2D, rockTextureID);
+
+    glPushMatrix();
+    glTranslatef(x, y, z);
+
+    GLfloat rock_mat[] = {1.0f, 1.0f, 1.0f, 1.0f};
+    glMaterialfv(GL_FRONT, GL_AMBIENT_AND_DIFFUSE, rock_mat);
+
+    GLUquadric* quad = gluNewQuadric();
+    gluQuadricTexture(quad, GL_TRUE);
+    gluSphere(quad, radius, 32, 32);
+    gluDeleteQuadric(quad);
+    
+    glPopMatrix();
+}
+
+void drawColliders() {
+    if (!showColliders) return;
+
+    glDisable(GL_LIGHTING);
+    glDisable(GL_TEXTURE_2D);
+    glLineWidth(2.0f);
+    const float wall_height = 3.6f;
+
+    // AABBを緑色で描画
+    glColor3f(0.0f, 1.0f, 0.0f);
+    for (const auto& box : wallColliders) {
+        glBegin(GL_LINE_LOOP);
+            glVertex3f(box.minX, 0.01f, box.minZ);
+            glVertex3f(box.maxX, 0.01f, box.minZ);
+            glVertex3f(box.maxX, 0.01f, box.maxZ);
+            glVertex3f(box.minX, 0.01f, box.maxZ);
+        glEnd();
+        glBegin(GL_LINE_LOOP);
+            glVertex3f(box.minX, wall_height, box.minZ);
+            glVertex3f(box.maxX, wall_height, box.minZ);
+            glVertex3f(box.maxX, wall_height, box.maxZ);
+            glVertex3f(box.minX, wall_height, box.maxZ);
+        glEnd();
+        glBegin(GL_LINES);
+            glVertex3f(box.minX, 0.01f, box.minZ); glVertex3f(box.minX, wall_height, box.minZ);
+            glVertex3f(box.maxX, 0.01f, box.minZ); glVertex3f(box.maxX, wall_height, box.minZ);
+            glVertex3f(box.maxX, 0.01f, box.maxZ); glVertex3f(box.maxX, wall_height, box.maxZ);
+            glVertex3f(box.minX, 0.01f, box.maxZ); glVertex3f(box.minX, wall_height, box.maxZ);
+        glEnd();
+    }
+
+    // OBBを赤色で描画
+    glColor3f(1.0f, 0.0f, 0.0f);
+    for (const auto& obb : obbColliders) {
+        std::vector<Vec2> vertices = getOBBVertices(obb);
+        glBegin(GL_LINE_LOOP);
+            glVertex3f(vertices[0].x, 0.01f, vertices[0].z);
+            glVertex3f(vertices[1].x, 0.01f, vertices[1].z);
+            glVertex3f(vertices[2].x, 0.01f, vertices[2].z);
+            glVertex3f(vertices[3].x, 0.01f, vertices[3].z);
+        glEnd();
+        glBegin(GL_LINE_LOOP);
+            glVertex3f(vertices[0].x, wall_height, vertices[0].z);
+            glVertex3f(vertices[1].x, wall_height, vertices[1].z);
+            glVertex3f(vertices[2].x, wall_height, vertices[2].z);
+            glVertex3f(vertices[3].x, wall_height, vertices[3].z);
+        glEnd();
+        glBegin(GL_LINES);
+            glVertex3f(vertices[0].x, 0.01f, vertices[0].z); glVertex3f(vertices[0].x, wall_height, vertices[0].z);
+            glVertex3f(vertices[1].x, 0.01f, vertices[1].z); glVertex3f(vertices[1].x, wall_height, vertices[1].z);
+            glVertex3f(vertices[2].x, 0.01f, vertices[2].z); glVertex3f(vertices[2].x, wall_height, vertices[2].z);
+            glVertex3f(vertices[3].x, 0.01f, vertices[3].z); glVertex3f(vertices[3].x, wall_height, vertices[3].z);
+        glEnd();
+    }
+
+    glLineWidth(1.0f);
+    glEnable(GL_TEXTURE_2D);
+    glEnable(GL_LIGHTING);
+}
+
+// =======================================================================
+// ★★★ ここから修正箇所 ★★★
+// =======================================================================
+
 void setupColliders() {
     wallColliders.clear();
+    obbColliders.clear();
 
     auto addCollider = [](float x, float z, float width, float depth) {
-        wallColliders.push_back({x, x + width, 0, 0, z, z + depth});
+        wallColliders.push_back({x, x + width, 0.0f, 3.6f, z, z + depth});
     };
+    
     float wall_thick = 0.5f;
     addCollider(15.0f,-45.0f,10.0f,wall_thick); addCollider(30.0f,-45.0f,10.0f,wall_thick);
-    addCollider(15.0f,-42.5f,wall_thick,5.0f); addCollider(40.0f,-42.5f,wall_thick,5.0f);
+    addCollider(15.0f,-45.0f,wall_thick,5.0f); addCollider(40.0f,-45.0f,wall_thick,5.0f);
     addCollider(15.0f,-25.0f,10.0f,wall_thick); addCollider(30.0f,-25.0f,10.0f,wall_thick);
-    addCollider(15.0f,-27.5f,wall_thick,5.0f); addCollider(40.0f,-27.5f,wall_thick,5.0f);
+    addCollider(15.0f,-30.0f,wall_thick,5.0f); addCollider(40.0f,-30.0f,wall_thick,5.0f);
     addCollider(15.0f,-5.0f,30.0f,wall_thick); addCollider(40.0f,0.0f,5.0f,wall_thick);
     addCollider(15.0f,0.0f,20.0f,wall_thick); addCollider(15.0f,5.0f,30.0f,wall_thick);
     addCollider(-45.0f,35.0f,30.0f,wall_thick); addCollider(-20.0f,40.0f,5.0f,wall_thick);
     addCollider(-45.0f,40.0f,20.0f,wall_thick); addCollider(-45.0f,45.0f,30.0f,wall_thick);
-    // ★ 追加した壁の当たり判定
     addCollider(10.0f,-41.0f,wall_thick,3.0f); 
     addCollider(-10.0f,-31.0f,wall_thick,3.0f); 
 
-    // --- (-10, 0, 35) に追加した窓付き壁 (drawWindowWallY) の当たり判定 (AABB) ---
+    // OBBとして-45度回転した壁を当たり判定リストに正しく追加
+    // 描画が-45度なので、当たり判定の計算では+45度を使う
+    float angle_rad = 45.0f * M_PI / 180.0f;
+    float w = 15.0f;
+    float d = wall_thick;
+    
+    obbColliders.push_back({ -30.0f + (w / 2.0f), 2.0f + (d / 2.0f), w / 2.0f, d / 2.0f, angle_rad });
+    obbColliders.push_back({ -40.0f + (w / 2.0f), -2.0f + (d / 2.0f), w / 2.0f, d / 2.0f, angle_rad });
+    
     { 
-        float wall_height = 3.6f;
-        float wall_width_z = 10.0f; // Z軸方向の幅
-        float wall_depth_x = wall_thick; // X軸方向の奥行き (0.5f)
-
+        float wall_width_z = 10.0f;
+        float wall_depth_x = wall_thick;
         const float windowWidthRatio = 0.4f;
-        const float windowHeightRatio = 0.4f;
-        float windowWidth = wall_width_z * windowWidthRatio; // Z軸方向の窓の幅 (4.0f)
-        float marginWidth = (wall_width_z - windowWidth) / 2.0f; // Z軸方向のマージン (3.0f)
-
-        float startX = -10.0f; // X座標の開始位置
-        float startZ = 35.0f; // Z座標の開始位置
-
-        // 1. 下の壁 (X: -10.0～-9.5, Z: 35.0～45.0)
-        addCollider(startX, startZ, wall_depth_x, wall_width_z);
-        // 2. 上の壁 (X: -10.0～-9.5, Z: 35.0～45.0)
-        addCollider(startX, startZ, wall_depth_x, wall_width_z);
-        // 3. 左の壁 (X: -10.0～-9.5, Z: 35.0～38.0)
+        float windowWidth = wall_width_z * windowWidthRatio;
+        float marginWidth = (wall_width_z - windowWidth) / 2.0f;
+        float startX = -10.0f;
+        float startZ = 35.0f;
         addCollider(startX, startZ, wall_depth_x, marginWidth);
-        // 4. 右の壁 (X: -10.0～-9.5, Z: 42.0～45.0)
-        float rightZ = startZ + marginWidth + windowWidth; // 35.0 + 3.0 + 4.0 = 42.0f
+        float rightZ = startZ + marginWidth + windowWidth;
         addCollider(startX, rightZ, wall_depth_x, marginWidth);
-    } // --- (-10, 0, 35) の当たり判定ここまで ---
+    }
 
-    // --- (-10, 0, -30) に追加した窓付き壁 (drawWindowWalls) の当たり判定 (AABB) ---
     { 
-        float wall_height = 3.6f;
-        float wall_width_x = 10.0f; // X軸方向の幅
-        float wall_depth_z = wall_thick; // Z軸方向の奥行き (0.5f)
-
+        float wall_width_x = 10.0f;
+        float wall_depth_z = wall_thick;
         const float windowWidthRatio = 0.4f;
-        const float windowHeightRatio = 0.4f;
-        float windowWidth = wall_width_x * windowWidthRatio; // X軸方向の窓の幅 (4.0f)
-        float marginWidth = (wall_width_x - windowWidth) / 2.0f; // X軸方向のマージン (3.0f)
-
-        float startX = -10.0f; // X座標の開始位置
-        float startZ = -30.0f; // Z座標の開始位置
-
-        // 1. 下の壁 (X: -10.0～0.0, Z: -30.0～-29.5)
-        addCollider(startX, startZ, wall_width_x, wall_depth_z);
-        // 2. 上の壁 (X: -10.0～0.0, Z: -30.0～-29.5)
-        addCollider(startX, startZ, wall_width_x, wall_depth_z);
-        // 3. 左の壁 (X: -10.0～-7.0, Z: -30.0～-29.5)
+        float windowWidth = wall_width_x * windowWidthRatio;
+        float marginWidth = (wall_width_x - windowWidth) / 2.0f;
+        float startX = -10.0f;
+        float startZ = -30.0f;
         addCollider(startX, startZ, marginWidth, wall_depth_z);
-        // 4. 右の壁 (X: -3.0～0.0, Z: -30.0～-29.5)
-        float rightX = startX + marginWidth + windowWidth; // -10.0 + 3.0 + 4.0 = -3.0f
+        float rightX = startX + marginWidth + windowWidth;
         addCollider(rightX, startZ, marginWidth, wall_depth_z);
-    } // --- (-10, 0, -30) の当たり判定ここまで ---
+    }
 
-    // --- (0, 0, -40) に追加した窓付き壁 (drawWindowWalls) の当たり判定 (AABB) ---
     { 
-        float wall_height = 3.6f;
-        float wall_width_x = 10.0f; // X軸方向の幅
-        float wall_depth_z = wall_thick; // Z軸方向の奥行き (0.5f)
-
+        float wall_width_x = 10.0f;
+        float wall_depth_z = wall_thick;
         const float windowWidthRatio = 0.4f;
-        const float windowHeightRatio = 0.4f;
-        float windowWidth = wall_width_x * windowWidthRatio; // X軸方向の窓の幅 (4.0f)
-        float marginWidth = (wall_width_x - windowWidth) / 2.0f; // X軸方向のマージン (3.0f)
-
-        float startX = 0.0f; // X座標の開始位置
-        float startZ = -40.0f; // Z座標の開始位置
-
-        // 1. 下の壁 (X: 0.0～10.0, Z: -40.0～-39.5)
-        addCollider(startX, startZ, wall_width_x, wall_depth_z);
-        // 2. 上の壁 (X: 0.0～10.0, Z: -40.0～-39.5)
-        addCollider(startX, startZ, wall_width_x, wall_depth_z);
-        // 3. 左の壁 (X: 0.0～3.0, Z: -40.0～-39.5)
+        float windowWidth = wall_width_x * windowWidthRatio;
+        float marginWidth = (wall_width_x - windowWidth) / 2.0f;
+        float startX = 0.0f;
+        float startZ = -40.0f;
         addCollider(startX, startZ, marginWidth, wall_depth_z);
-        // 4. 右の壁 (X: 7.0～10.0, Z: -40.0～-39.5)
-        float rightX = startX + marginWidth + windowWidth; // 0.0 + 3.0 + 4.0 = 7.0f
+        float rightX = startX + marginWidth + windowWidth;
         addCollider(rightX, startZ, marginWidth, wall_depth_z);
-    } // --- (0, 0, -40) の当たり判定ここまで ---
+    }
 
-    // ★ 床の端の見えない壁の当たり判定を追加
     float groundEdge = 50.0f;
-    float boundaryWidth = 100.0f; // -50 to 50
-    // Z = -50 の外側
+    float boundaryWidth = 100.0f;
     addCollider(-groundEdge, -groundEdge - wall_thick, boundaryWidth, wall_thick);
-    // Z = 50 の外側
     addCollider(-groundEdge, groundEdge, boundaryWidth, wall_thick);
-    // X = -50 の外側
     addCollider(-groundEdge - wall_thick, -groundEdge, wall_thick, boundaryWidth);
-    // X = 50 の外側
     addCollider(groundEdge, -groundEdge, wall_thick, boundaryWidth);
 
+    float rockRadius = 5.0f;
+    float rockX = -35.0f;
+    float rockZ = -35.0f;
+    wallColliders.push_back({rockX - rockRadius, rockX + rockRadius, 0, 0, rockZ - rockRadius, rockZ + rockRadius});
 }
-
-
-/**
- * @brief パレットオブジェクトを初期化・配置する
- */
 void setupPallets() {
     BoundingBox palletBaseBBox = calculateModelBBox(paletModel);
     const float x_scale_factor = 16.0f;
@@ -528,9 +743,6 @@ void setupPallets() {
     pallets.push_back({17.0f, 1.8f, -0.4f, 0.0f, 90.0f, 0.0f, 'z', palletBaseBBox, IDLE, 1.8f, 0.15f});
 }
 
-/**
- * @brief 毎フレームのメイン描画処理を行う
- */
 void display() {
     glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
     glLoadIdentity();
@@ -540,20 +752,21 @@ void display() {
     glEnable(GL_TEXTURE_2D);
     drawGround();
     drawWalls();
-
+    drawTree();
     drawAxes();
-    drawObjModel(testModel, 0.0f, 0.01f, 0.0f, 0.01f, 0.0f, 0.0f, 0.0f);
     drawObjModel(blenderModel, 30.0f, 3.0f, 30.0f, 3.0f, 0.0f, 180.0f, 0.0f);
     for (const auto& pallet : pallets) {
         drawObjModel(paletModel, pallet.x, pallet.visualY, pallet.z, pallet.scale, pallet.rotationX, pallet.rotationY, pallet.rotationZ);
     }
+    drawFallingLeaves();
+    drawRock(-35.0f, 0.0f, -35.0f, 5.0f); 
+
+    drawColliders();
+
     drawHUD();
     glutSwapBuffers();
 }
 
-/**
- * @brief パレットの状態（アニメーションなど）を更新する
- */
 void updatePallets() {
     for (auto& pallet : pallets) {
         if (pallet.state == TIPPING) {
@@ -578,53 +791,175 @@ void updatePallets() {
     }
 }
 
-/**
- * @brief 当たり判定をチェックするためのヘルパー関数
- */
-bool checkCollision(float x, float z) {
-    const float playerWidth = 0.2f; // プレイヤーの半径
-    const float playerHeight = spawnY; // プレイヤーのY座標 (カメラの高さ)
+void spawnLeaf(float treeCenterY) {
+    std::uniform_real_distribution<float> distAngle(0.0f, 2.0f * M_PI);
+    std::uniform_real_distribution<float> distRadius(0.0f, treeLeafSpawnRadius);
+    std::uniform_real_distribution<float> distHeightOffset(0.0f, 3.0f);
+    std::uniform_real_distribution<float> distInitialVelocity(-0.02f, 0.02f);
+    std::uniform_real_distribution<float> distVyInitial(-0.05f, -0.01f);
+    std::uniform_real_distribution<float> distRotSpeed(-100.0f, 100.0f);
+    std::uniform_real_distribution<float> distScale(0.3f, 0.6f);
+    std::uniform_real_distribution<float> distLifeTime(5.0f, 15.0f);
 
-    // 壁との当たり判定 (AABB)
-    for (const auto& box : wallColliders) {
-        // Y軸 (高さ) のチェックは不要 (窓の当たり判定は AABB で設定済みのため)
-        if (x + playerWidth > box.minX && x - playerWidth < box.maxX &&
-            z + playerWidth > box.minZ && z - playerWidth < box.maxZ) {
-            return true;
-        }
+    float angle = distAngle(rng);
+    float radius = distRadius(rng);
+    
+    Leaf newLeaf;
+    newLeaf.x = treeX + cos(angle) * radius;
+    newLeaf.y = treeCenterY + treeLeafSpawnHeightOffset + distHeightOffset(rng);
+    newLeaf.z = treeZ + sin(angle) * radius;
+    newLeaf.vx = distInitialVelocity(rng);
+    newLeaf.vy = distVyInitial(rng);
+    newLeaf.vz = distInitialVelocity(rng);
+    newLeaf.rotationAngleX = distAngle(rng) * 180.0f / M_PI;
+    newLeaf.rotationAngleY = distAngle(rng) * 180.0f / M_PI;
+    newLeaf.rotationAngleZ = distAngle(rng) * 180.0f / M_PI;
+    newLeaf.rotationSpeedX = distRotSpeed(rng);
+    newLeaf.rotationSpeedY = distRotSpeed(rng);
+    newLeaf.rotationSpeedZ = distRotSpeed(rng);
+    newLeaf.scale = distScale(rng);
+    newLeaf.lifeTime = 0.0f;
+    newLeaf.maxLifeTime = distLifeTime(rng);
+    newLeaf.textureID = leafTextureID;
+    
+    std::uniform_real_distribution<float> distColor(0.0f, 1.0f);
+    float r = 0.1f + distColor(rng) * 0.2f;
+    float g = 0.5f + distColor(rng) * 0.3f;
+    float b = 0.0f + distColor(rng) * 0.1f;
+    newLeaf.color[0] = r;
+    newLeaf.color[1] = g;
+    newLeaf.color[2] = b;
+    newLeaf.color[3] = 0.8f;
+
+    fallingLeaves.push_back(newLeaf);
+}
+
+void updateFallingLeaves(float deltaTime) {
+    for (auto& leaf : fallingLeaves) {
+        leaf.x += leaf.vx * deltaTime;
+        leaf.y += leaf.vy * deltaTime;
+        leaf.z += leaf.vz * deltaTime;
+
+        leaf.rotationAngleX += leaf.rotationSpeedX * deltaTime;
+        leaf.rotationAngleY += leaf.rotationSpeedY * deltaTime;
+        leaf.rotationAngleZ += leaf.rotationSpeedZ * deltaTime;
+
+        leaf.rotationAngleX = fmod(leaf.rotationAngleX, 360.0f);
+        leaf.rotationAngleY = fmod(leaf.rotationAngleY, 360.0f);
+        leaf.rotationAngleZ = fmod(leaf.rotationAngleZ, 360.0f);
+
+        leaf.lifeTime += deltaTime;
+        leaf.vy -= 0.5f * deltaTime;
+
+        float noiseScale = 0.5f;
+        float windX = perlinNoise(leaf.x * noiseScale + g_time * 0.1f, leaf.y * noiseScale, leaf.z * noiseScale) * 2.0f - 1.0f;
+        float windZ = perlinNoise(leaf.x * noiseScale, leaf.y * noiseScale + g_time * 0.1f, leaf.z * noiseScale) * 2.0f - 1.0f;
+        leaf.vx += windX * 0.01f * deltaTime;
+        leaf.vz += windZ * 0.01f * deltaTime;
+        
+        float maxFallSpeed = -0.5f;
+        if (leaf.vy < maxFallSpeed) leaf.vy = maxFallSpeed;
     }
 
-    // パレットとの当たり判定 (Y軸回転のみ考慮したOBB)
-    for (const auto& pallet : pallets) {
-        if (pallet.state != IDLE) {
-            float translatedX = x - pallet.x;
-            float translatedZ = z - pallet.z;
-            float angleRad = -pallet.rotationY * M_PI / 180.0f;
-            float localX = translatedX * cos(angleRad) - translatedZ * sin(angleRad);
-            float localZ = translatedX * sin(angleRad) + translatedZ * cos(angleRad);
-            
-            float scaledMinY = pallet.localBBox.minY * pallet.scale;
-            float scaledMaxY = pallet.localBBox.maxY * pallet.scale;
-            
-            float localPlayerY = playerHeight - pallet.y; 
+    fallingLeaves.erase(std::remove_if(fallingLeaves.begin(), fallingLeaves.end(), 
+        [&](const Leaf& leaf) {
+            return leaf.y < 0.0f || leaf.lifeTime > leaf.maxLifeTime;
+        }), 
+        fallingLeaves.end());
 
-            if (localX + playerWidth > pallet.localBBox.minX * pallet.scale && localX - playerWidth < pallet.localBBox.maxX * pallet.scale &&
-                localZ + playerWidth > pallet.localBBox.minZ * pallet.scale && localZ - playerWidth < pallet.localBBox.maxZ * pallet.scale &&
-                localPlayerY > scaledMinY && localPlayerY < scaledMaxY) // Y軸チェック
-            {
-                return true;
+    float distToTree = sqrt(pow(cameraX - treeX, 2) + pow(cameraZ - treeZ, 2));
+    if (distToTree < 10.0f) {
+        std::uniform_int_distribution<int> distChance(0, 99);
+        if (distChance(rng) < 10) {
+            spawnLeaf(treeY);
+        }
+    }
+}
+
+bool checkAABBCollision(float newX, float newZ, float& correctionX, float& correctionZ) {
+    correctionX = 0.0f;
+    correctionZ = 0.0f;
+
+    for (const auto& box : wallColliders) {
+        float overlapX = std::max(0.0f, std::min(newX + playerWidth, box.maxX) - std::max(newX - playerWidth, box.minX));
+        float overlapZ = std::max(0.0f, std::min(newZ + playerWidth, box.maxZ) - std::max(newZ - playerWidth, box.minZ));
+
+        if (overlapX > 0 && overlapZ > 0) {
+            printf("[DEBUG] Collision with AABB! Player at (%.2f, %.2f)\n", newX, newZ);
+            if (overlapX < overlapZ) {
+                correctionX = (newX < (box.minX + box.maxX) / 2.0f) ? -overlapX : overlapX;
+            } else {
+                correctionZ = (newZ < (box.minZ + box.maxZ) / 2.0f) ? -overlapZ : overlapZ;
             }
+            return true;
         }
     }
     return false;
 }
 
-/**
- * @brief タイマーで呼び出され、プレイヤーの位置やオブジェクトの状態を更新する
- */
+bool checkOBBCollision(float newX, float newZ, float& correctionX, float& correctionZ) {
+    correctionX = 0.0f;
+    correctionZ = 0.0f;
+    
+    std::vector<Vec2> playerVertices = {
+        {newX - playerWidth, newZ - playerWidth},
+        {newX + playerWidth, newZ - playerWidth},
+        {newX + playerWidth, newZ + playerWidth},
+        {newX - playerWidth, newZ + playerWidth}
+    };
+    std::vector<Vec2> playerAxes = {{1, 0}, {0, 1}};
+
+    for (const auto& obb : obbColliders) {
+        std::vector<Vec2> obbVertices = getOBBVertices(obb);
+        
+        float cosA = cosf(obb.angle);
+        float sinA = sinf(obb.angle);
+        std::vector<Vec2> obbAxes = { {cosA, sinA}, {-sinA, cosA} };
+
+        std::vector<Vec2> axes = playerAxes;
+        axes.insert(axes.end(), obbAxes.begin(), obbAxes.end());
+
+        float minOverlap = std::numeric_limits<float>::max();
+        Vec2 mtvAxis = {0, 0};
+        
+        bool separated = false;
+        for (const auto& axis : axes) {
+            float playerMin, playerMax, obbMin, obbMax;
+            projectPolygon(playerVertices, axis, playerMin, playerMax);
+            projectPolygon(obbVertices, axis, obbMin, obbMax);
+
+            if (playerMax < obbMin || obbMax < playerMin) {
+                separated = true;
+                break;
+            } else {
+                float overlap = std::min(playerMax, obbMax) - std::max(playerMin, obbMin);
+                if (overlap < minOverlap) {
+                    minOverlap = overlap;
+                    mtvAxis = axis;
+                }
+            }
+        }
+
+        if (!separated) {
+            printf("[DEBUG] OBB Collision DETECTED! Player(%.2f, %.2f) vs OBB_Center(%.2f, %.2f)\n", newX, newZ, obb.cx, obb.cz);
+            Vec2 centerToCenter = {obb.cx - newX, obb.cz - newZ};
+            if (dot(centerToCenter, mtvAxis) < 0) {
+                mtvAxis = mtvAxis * -1.0f;
+            }
+            correctionX = mtvAxis.x * minOverlap;
+            correctionZ = mtvAxis.z * minOverlap;
+            printf("[DEBUG] Collision response TRIGGERED. Correction: (%.4f, %.4f)\n", correctionX, correctionZ);
+            return true;
+        }
+    }
+    return false;
+}
+
 void update(int value) {
-    g_time += 1.0f / 60.0f;
+    float deltaTime = 1.0f / 60.0f;
+    g_time += deltaTime;
     updatePallets();
+    updateFallingLeaves(deltaTime);
 
     float forwardX = cos(yaw), forwardZ = sin(yaw), rightX = -forwardZ, rightZ = forwardX;
     float moveX = 0.0f, moveZ = 0.0f;
@@ -637,34 +972,38 @@ void update(int value) {
         moveZ /= magnitude;
     }
     
-    float move_vec_x = moveX * moveSpeed;
-    float move_vec_z = moveZ * moveSpeed;
+    float targetX = cameraX + moveX * moveSpeed;
+    float targetZ = cameraZ + moveZ * moveSpeed;
 
-    if (!checkCollision(cameraX + move_vec_x, cameraZ + move_vec_z)) {
-        cameraX += move_vec_x;
-        cameraZ += move_vec_z;
-    } else {
-        if (!checkCollision(cameraX + move_vec_x, cameraZ)) {
-            cameraX += move_vec_x;
+    const int collisionIterations = 3; 
+    for (int i = 0; i < collisionIterations; ++i) {
+        float correctionX, correctionZ;
+        if (checkAABBCollision(targetX, targetZ, correctionX, correctionZ)) {
+            targetX += correctionX;
+            targetZ += correctionZ;
         }
-        if (!checkCollision(cameraX, cameraZ + move_vec_z)) {
-            cameraZ += move_vec_z;
+        if (checkOBBCollision(targetX, targetZ, correctionX, correctionZ)) {
+            targetX += correctionX;
+            targetZ += correctionZ;
         }
     }
 
+    cameraX = targetX;
+    cameraZ = targetZ;
     cameraY = spawnY;
     
     glutPostRedisplay();
     glutTimerFunc(16, update, 0);
 }
 
-/**
- * @brief キーが押されたときの処理を行うコールバック関数
- */
 void keyboard(unsigned char key, int x, int y) {
     keyStates[tolower(key)] = true;
     switch (key) {
         case 27: exit(0); break;
+        case 'c':
+        case 'C':
+            showColliders = !showColliders;
+            break;
         case ' ': {
             const float interactDistance = 3.0f;
             for (auto& pallet : pallets) {
@@ -683,22 +1022,14 @@ void keyboard(unsigned char key, int x, int y) {
     }
 }
 
-/**
- * @brief キーが離されたときの処理を行うコールバック関数
- */
 void keyboardUp(unsigned char key, int x, int y) { keyStates[tolower(key)] = false; }
 
-/**
- * @brief マウスが動いたときの処理を行うコールバック関数（縦横マウスルック）
- *
- */
 void mouseMotion(int x, int y) {
     if (!isMouseLookActive) return;
 
     const int centerX = windowWidth / 2;
     const int centerY = windowHeight / 2;
 
-    // warp によるイベントは無視する（ワープ直後の不正なジャンプ防止）
     if (justWarped) {
         justWarped = false;
         lastMouseX = centerX;
@@ -706,59 +1037,46 @@ void mouseMotion(int x, int y) {
         return;
     }
 
-    // 再フォーカス時に段階的に復元するためのカウンタ（static で保持）
     static int reentryFrames = 0;
-    const int REENTRY_DURATION = 12; // このフレーム数でフェードインする（増やすとより緩やか）
+    const int REENTRY_DURATION = 12;
 
-    // 初回はポインタ位置を基準にして次のイベントから差分を取る（ワープしない）
     if (firstMouse) {
         firstMouse = false;
         lastMouseX = x;
         lastMouseY = y;
-        // ウィンドウに「戻った」直後とみなし、段階的復帰を開始する
         reentryFrames = REENTRY_DURATION;
         return;
     }
 
-    // 前回位置との差分を使う（横と縦）
-    float deltaX = static_cast<float>(x - lastMouseX);      // 右移動で正
-    float deltaY = static_cast<float>(lastMouseY - y);      // Y軸は反転（上移動で正）
+    float deltaX = static_cast<float>(x - lastMouseX);
+    float deltaY = static_cast<float>(lastMouseY - y);
 
-    // 異常に大きなジャンプを防ぐためにクランプ（ゆるめに）
     const float maxDelta = 200.0f;
     if (deltaX > maxDelta) deltaX = maxDelta;
     if (deltaX < -maxDelta) deltaX = -maxDelta;
     if (deltaY > maxDelta) deltaY = maxDelta;
     if (deltaY < -maxDelta) deltaY = -maxDelta;
 
-    // 再フォーカス直後なら、移動量をフェードイン（段階的に増やす）
     float fadeFactor = 1.0f;
     if (reentryFrames > 0) {
-        // 1/Reentry から始まり徐々に 1.0 に到達する（線形）
         fadeFactor = (float)(REENTRY_DURATION - reentryFrames + 1) / (float)REENTRY_DURATION;
         reentryFrames--;
     }
 
-    // カメラ回転の更新（横: yaw, 縦: pitch）にフェード係数を掛ける
     yaw   += deltaX * mouseSensitivity * fadeFactor;
     pitch += deltaY * mouseSensitivity * fadeFactor;
 
-    // ピッチのクランプ
     const float pitchLimit = M_PI_2 - 0.1f;
     if (pitch > pitchLimit) pitch = pitchLimit;
     if (pitch < -pitchLimit) pitch = -pitchLimit;
 
-    // yaw を正規化して発散を防ぐ（任意）
     if (yaw > M_PI) yaw -= 2.0f * M_PI;
     if (yaw <= -M_PI) yaw += 2.0f * M_PI;
 
-    // 今回のマウス位置を保存
     lastMouseX = x;
     lastMouseY = y;
 
-    // ポインタがウィンドウの端に近づいたら中央に補正して次イベントを無視する
-    // ※ 閾値は小さめにしてワープ頻度を抑え、ユーザー体験を穏やかにする
-    const int edgeThreshold = 20; // 小さめの閾値でワープのトリガーを限定
+    const int edgeThreshold = 20;
     if (x < edgeThreshold || x > windowWidth - edgeThreshold ||
         y < edgeThreshold || y > windowHeight - edgeThreshold) {
         glutWarpPointer(centerX, centerY);
@@ -768,9 +1086,6 @@ void mouseMotion(int x, int y) {
     }
 }
 
-/**
- * @brief ウィンドウサイズが変更されたときの処理を行うコールバック関数
- */
 void reshape(int w, int h) {
     windowWidth = w; windowHeight = h;
     glViewport(0, 0, w, h);
@@ -779,9 +1094,6 @@ void reshape(int w, int h) {
     glMatrixMode(GL_MODELVIEW);
 }
 
-/**
- * @brief マウスがウィンドウ内に出入りした際の処理
- */
 void entry(int state) {
     if (state == GLUT_ENTERED) {
         isMouseLookActive = true;
@@ -812,13 +1124,19 @@ void initScene() {
     if (!loadTexture("wall.jpg", wallTextureID)) {
         printf("Failed to load wall texture.\n");
     }
+    if (!loadTexture("stone.jpg", rockTextureID)) {
+        printf("Failed to load rock texture.\n");
+    }
+    if (!loadTexture("leaf.jpg", leafTextureID, false)) { 
+        printf("Failed to load leaf texture.\n");
+    }
 
     glEnable(GL_TEXTURE_2D);
-    if(!loadObjModel(testModel, "../obj/test.obj")) { std::cerr << "Failed to load test.obj" << std::endl; }
     if(!loadObjModel(paletModel, "../obj/palet.obj")) { std::cerr << "Failed to load palet.obj" << std::endl; }
     if(!loadObjModel(blenderModel, "../obj/house.obj")) { std::cerr << "Failed to load house.obj" << std::endl; }
     setupColliders();
     setupPallets();
+    initPerlinNoise();
 }
 
 int main(int argc, char** argv) {
