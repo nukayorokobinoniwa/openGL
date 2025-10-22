@@ -96,6 +96,7 @@ struct Pallet {
     PalletState state = IDLE;
     float visualY = 0.0f;
     float scale = 0.15f;
+    bool collisionAdded = false; // ★★★ 当たり判定追加済みフラグを追加 ★★★
 };
 
 // 落ちる葉っぱの構造体
@@ -750,8 +751,8 @@ void setupPallets() {
     palletBaseBBox.minZ *= z_scale_factor;
     palletBaseBBox.maxZ *= z_scale_factor;
 
-    pallets.push_back({-17.0f, 1.8f, 39.6f, 0.0f, 90.0f, 0.0f, 'z', palletBaseBBox, IDLE, 1.8f, 0.15f});
-    pallets.push_back({17.0f, 1.8f, -0.4f, 0.0f, 90.0f, 0.0f, 'z', palletBaseBBox, IDLE, 1.8f, 0.15f});
+    pallets.push_back({-17.0f, 1.8f, 39.6f, 0.0f, 90.0f, 0.0f, 'z', palletBaseBBox, IDLE, 1.8f, 0.15f, false});
+    pallets.push_back({17.0f, 1.8f, -0.4f, 0.0f, 90.0f, 0.0f, 'z', palletBaseBBox, IDLE, 1.8f, 0.15f, false});
 }
 
 void display() {
@@ -798,6 +799,37 @@ void updatePallets() {
                 pallet.state = TIPPED;
             }
         }
+
+        // ★★★ ここからが修正箇所 ★★★
+        // パレットが倒れきって、まだ当たり判定が追加されていない場合
+        if (pallet.state == TIPPED && !pallet.collisionAdded) {
+            // パレットはY軸で90度回転しているため、ワールド空間での幅と奥行きは
+            // モデルのローカル空間でのX(厚み)とZ(長さ)が入れ替わったものに近くなる
+            // ただし、OBBの角度で調整するため、widthはモデルのX、depthはモデルのZで計算
+            float halfWidth = (pallet.localBBox.maxX - pallet.localBBox.minX) * pallet.scale / 2.0f;
+            float halfDepth = (pallet.localBBox.maxZ - pallet.localBBox.minZ) * pallet.scale / 2.0f;
+            
+            // Y軸周りの回転をラジアンに変換
+            float angle_rad = pallet.rotationY * M_PI / 180.0f;
+            
+            // 新しいOBBを作成し、パラメータを設定
+            OBB newCollider;
+            newCollider.cx = pallet.x;
+            newCollider.cz = pallet.z;
+            newCollider.halfWidth = halfWidth;
+            newCollider.halfDepth = halfDepth;
+            newCollider.angle = angle_rad;
+            
+            // グローバルなOBBリストに当たり判定を追加
+            obbColliders.push_back(newCollider);
+            
+            // フラグを立てて、重複して追加されるのを防ぐ
+            pallet.collisionAdded = true;
+
+            std::cout << "Added OBB collider for tipped pallet." << std::endl;
+        }
+        // ★★★ 修正ここまで ★★★
+
         pallet.visualY = pallet.y + sin(g_time * 4.0f) * 0.05f;
     }
 }
