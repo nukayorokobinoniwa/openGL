@@ -1,5 +1,4 @@
 #include <GL/glut.h>
-#include <GL/glu.h>
 #define _USE_MATH_DEFINES
 #include <cmath>
 #include <vector>
@@ -13,6 +12,7 @@
 #include <algorithm>
 #include <numeric>
 #include <limits>
+#include <cstring> 
 
 #define TINYOBJLOADER_IMPLEMENTATION
 #include "tiny_obj_loader.h"
@@ -20,9 +20,151 @@
 // 乱数生成器
 std::mt19937 rng(std::random_device{}());
 
+// 3Dベクトル用の構造体
+struct Vec3 {
+    float x, y, z;
+};
+
+/**
+ * @brief 2つの3Dベクトルの外積を計算する。
+ * @param a 1つ目のベクトル
+ * @param b 2つ目のベクトル
+ * @return 2つのベクトルの外積ベクトル
+ */
+Vec3 cross(const Vec3& a, const Vec3& b) {
+    return {a.y * b.z - a.z * b.y, a.z * b.x - a.x * b.z, a.x * b.y - a.y * b.x};
+}
+
+/**
+ * @brief 2つの3Dベクトルの内積を計算する。
+ * @param a 1つ目のベクトル
+ * @param b 2つ目のベクトル
+ * @return 2つのベクトルの内積
+ */
+float dot(const Vec3& a, const Vec3& b) {
+    return a.x * b.x + a.y * b.y + a.z * b.z;
+}
+
+/**
+ * @brief 3Dベクトルを正規化する（長さを1にする）。
+ * @param v 正規化するベクトル
+ * @return 正規化されたベクトル
+ */
+Vec3 normalize(const Vec3& v) {
+    float len = std::sqrt(dot(v, v));
+    if (len > 0) {
+        return {v.x / len, v.y / len, v.z / len};
+    }
+    return v;
+}
+
+/**
+ * @brief 透視投影行列を作成する。
+ * @param mat 結果を格納する16要素のfloat配列
+ * @param fovY Y方向の視野角 (度数法)
+ * @param aspect アスペクト比 (幅 / 高さ)
+ * @param zNear 前方クリッピング面までの距離
+ * @param zFar 後方クリッピング面までの距離
+ */
+void perspectiveMatrix(float* mat, float fovY, float aspect, float zNear, float zFar) {
+    memset(mat, 0, 16 * sizeof(float));
+    float f = 1.0f / tanf(fovY * (M_PI / 180.0f) / 2.0f);
+    mat[0] = f / aspect;
+    mat[5] = f;
+    mat[10] = (zFar + zNear) / (zNear - zFar);
+    mat[11] = -1.0f;
+    mat[14] = (2.0f * zFar * zNear) / (zNear - zFar);
+}
+
+/**
+ * @brief ビュー行列（カメラの位置と向き）を作成する。
+ * @param mat 結果を格納する16要素のfloat配列
+ * @param eye カメラの位置ベクトル
+ * @param center カメラの注視点の位置ベクトル
+ * @param up カメラの上方向を示すベクトル
+ */
+void lookAtMatrix(float* mat, const Vec3& eye, const Vec3& center, const Vec3& up) {
+    Vec3 f = normalize({center.x - eye.x, center.y - eye.y, center.z - eye.z});
+    Vec3 s = normalize(cross(f, up));
+    Vec3 u = cross(s, f);
+
+    mat[0] = s.x;
+    mat[4] = s.y;
+    mat[8] = s.z;
+    mat[12] = -dot(s, eye);
+
+    mat[1] = u.x;
+    mat[5] = u.y;
+    mat[9] = u.z;
+    mat[13] = -dot(u, eye);
+
+    mat[2] = -f.x;
+    mat[6] = -f.y;
+    mat[10] = -f.z;
+    mat[14] = dot(f, eye);
+
+    mat[3] = 0.0f;
+    mat[7] = 0.0f;
+    mat[11] = 0.0f;
+    mat[15] = 1.0f;
+}
+
+/**
+ * @brief テクスチャマッピング可能な球体を描画する。
+ * @param radius 球の半径
+ * @param slices 経度方向の分割数
+ * @param stacks 緯度方向の分割数
+ */
+void drawTexturedSphere(GLdouble radius, GLint slices, GLint stacks) {
+    for (int i = 0; i < stacks; ++i) {
+        GLdouble lat0 = M_PI * (-0.5 + (double)i / stacks);
+        GLdouble z0 = radius * sin(lat0);
+        GLdouble zr0 = radius * cos(lat0);
+        GLdouble lat1 = M_PI * (-0.5 + (double)(i + 1) / stacks);
+        GLdouble z1 = radius * sin(lat1);
+        GLdouble zr1 = radius * cos(lat1);
+        glBegin(GL_QUAD_STRIP);
+        for (int j = 0; j <= slices; ++j) {
+            GLdouble lng = 2 * M_PI * (double)j / slices;
+            GLdouble x = cos(lng);
+            GLdouble y = sin(lng);
+            glNormal3d(x * zr1, y * zr1, z1);
+            glTexCoord2d((double)j / slices, (double)(i + 1) / stacks);
+            glVertex3d(x * zr1, y * zr1, z1);
+            glNormal3d(x * zr0, y * zr0, z0);
+            glTexCoord2d((double)j / slices, (double)i / stacks);
+            glVertex3d(x * zr0, y * zr0, z0);
+        }
+        glEnd();
+    }
+}
+
+
 // Perlin Noise用のヘルパー関数
+/**
+ * @brief パーリンノイズで滑らかな補間を行うためのフェード関数。
+ * @param t 入力値 (通常0.0～1.0)
+ * @return 補間された値
+ */
 float fade(float t) { return t * t * t * (t * (t * 6 - 15) + 10); }
+
+/**
+ * @brief 線形補間を行う。
+ * @param a 開始値
+ * @param b 終了値
+ * @param t 補間係数 (0.0～1.0)
+ * @return 補間された値
+ */
 float linearInterpolate(float a, float b, float t) { return a + t * (b - a); }
+
+/**
+ * @brief ハッシュ値に基づいて勾配ベクトルを計算する。
+ * @param hash ハッシュ値
+ * @param x x座標
+ * @param y y座標
+ * @param z z座標
+ * @return 勾配ベクトルの計算結果
+ */
 float grad(int hash, float x, float y, float z) {
     int h = hash & 15;
     float u = h < 8 ? x : y;
@@ -31,6 +173,9 @@ float grad(int hash, float x, float y, float z) {
 }
 int p[512]; // Permutation table
 
+/**
+ * @brief パーリンノイズ生成器を初期化する。ランダムな置換テーブルを作成する。
+ */
 void initPerlinNoise() {
     std::iota(p, p + 256, 0);
     std::shuffle(p, p + 256, rng);
@@ -39,6 +184,13 @@ void initPerlinNoise() {
     }
 }
 
+/**
+ * @brief 3次元パーリンノイズを生成する。
+ * @param x x座標
+ * @param y y座標
+ * @param z z座標
+ * @return 0.0から1.0の範囲のノイズ値
+ */
 float perlinNoise(float x, float y, float z) {
     int X = (int)floor(x) & 255;
     int Y = (int)floor(y) & 255;
@@ -96,7 +248,7 @@ struct Pallet {
     PalletState state = IDLE;
     float visualY = 0.0f;
     float scale = 0.15f;
-    bool collisionAdded = false; // ★★★ 当たり判定追加済みフラグを追加 ★★★
+    bool collisionAdded = false;
 };
 
 // 落ちる葉っぱの構造体
@@ -147,7 +299,11 @@ float dot(const Vec2& v1, const Vec2& v2) { return v1.x * v2.x + v1.z * v2.z; }
 float lengthSq(const Vec2& v) { return dot(v, v); }
 float length(const Vec2& v) { return std::sqrt(lengthSq(v)); }
 
-// OBBの頂点を計算する関数
+/**
+ * @brief OBB（有向境界ボックス）の4つの頂点座標を計算する。
+ * @param obb 頂点を計算するOBB
+ * @return 4つの頂点(Vec2)のベクター
+ */
 std::vector<Vec2> getOBBVertices(const OBB& obb) {
     std::vector<Vec2> vertices(4);
     float cosA = cosf(obb.angle);
@@ -167,7 +323,13 @@ std::vector<Vec2> getOBBVertices(const OBB& obb) {
     return vertices;
 }
 
-// プロジェクションを計算するヘルパー関数
+/**
+ * @brief ポリゴンの頂点を指定された軸に射影し、最小値と最大値を見つける。
+ * @param vertices ポリゴンの頂点のベクター
+ * @param axis 射影する軸
+ * @param min 射影の最小値を格納する参照
+ * @param max 射影の最大値を格納する参照
+ */
 void projectPolygon(const std::vector<Vec2>& vertices, const Vec2& axis, float& min, float& max) {
     min = std::numeric_limits<float>::max();
     max = std::numeric_limits<float>::lowest();
@@ -178,7 +340,11 @@ void projectPolygon(const std::vector<Vec2>& vertices, const Vec2& axis, float& 
     }
 }
 
-// --- 関数定義 (描画関連など変更なしの部分は省略) ---
+/**
+ * @brief モデルの頂点データからAABB（軸並行境界ボックス）を計算する。
+ * @param model バウンディングボックスを計算するモデル
+ * @return 計算されたBoundingBox構造体
+ */
 BoundingBox calculateModelBBox(const Model& model) {
     if (model.attrib.vertices.empty()) { return {0,0,0,0,0,0}; }
     float minX = model.attrib.vertices[0], maxX = model.attrib.vertices[0];
@@ -195,6 +361,12 @@ BoundingBox calculateModelBBox(const Model& model) {
     return {minX, maxX, minY, maxY, minZ, maxZ};
 }
 
+/**
+ * @brief .objファイルから3Dモデルを読み込む。
+ * @param model 読み込んだモデルデータを格納するModel構造体への参照
+ * @param filepath モデルファイルのパス
+ * @return 読み込みが成功したかどうか (true/false)
+ */
 bool loadObjModel(Model& model, const std::string& filepath) {
     std::string warn, err;
     std::string base_dir = filepath.substr(0, filepath.find_last_of("/\\") + 1);
@@ -205,10 +377,27 @@ bool loadObjModel(Model& model, const std::string& filepath) {
     return model.loaded;
 }
 
-void drawObjModel(const Model& model, float x, float y, float z, float scale, float rx, float ry, float rz) {
+/**
+ * @brief 読み込んだ.objモデルを描画する。
+ * @param model 描画するModel構造体
+ * @param x ワールド座標X
+ * @param y ワールド座標Y
+ * @param z ワールド座標Z
+ * @param scale モデルのスケール
+ * @param rx X軸周りの回転角度
+ * @param ry Y軸周りの回転角度
+ * @param rz Z軸周りの回転角度
+ * @param emissionColor 発光マテリアルの色。nullptrの場合は発光しない。
+ */
+void drawObjModel(const Model& model, float x, float y, float z, float scale, float rx, float ry, float rz, const GLfloat* emissionColor = nullptr) {
     if (!model.loaded) return;
     glDisable(GL_TEXTURE_2D);
     glPushMatrix();
+
+    if (emissionColor != nullptr) {
+        glMaterialfv(GL_FRONT, GL_EMISSION, emissionColor);
+    }
+
     glTranslatef(x, y, z);
     glRotatef(ry, 0.0f, 1.0f, 0.0f);
     glRotatef(rx, 1.0f, 0.0f, 0.0f);
@@ -239,10 +428,23 @@ void drawObjModel(const Model& model, float x, float y, float z, float scale, fl
             index_offset += fv;
         }
     }
+    
+    if (emissionColor != nullptr) {
+        GLfloat no_emission[] = {0.0f, 0.0f, 0.0f, 1.0f};
+        glMaterialfv(GL_FRONT, GL_EMISSION, no_emission);
+    }
+
     glPopMatrix();
     glEnable(GL_TEXTURE_2D);
 }
 
+/**
+ * @brief OpenCVを使用して画像ファイルを読み込み、OpenGLテクスチャとして生成する。
+ * @param filename テクスチャとして使用する画像ファイルのパス
+ * @param textureID 生成されたテクスチャのIDを格納する変数への参照
+ * @param alpha アルファチャンネル（透明度）を持つ画像として読み込むか
+ * @return 読み込みが成功したかどうか (true/false)
+ */
 bool loadTexture(const char* filename, GLuint& textureID, bool alpha = false) {
     cv::Mat image = cv::imread(filename, alpha ? cv::IMREAD_UNCHANGED : cv::IMREAD_COLOR);
     if (image.empty()) {
@@ -270,11 +472,22 @@ bool loadTexture(const char* filename, GLuint& textureID, bool alpha = false) {
     return true;
 }
 
+/**
+ * @brief 画面上の指定した3D座標にビットマップフォントで文字列を描画する。
+ * @param x 文字列を描画するX座標
+ * @param y 文字列を描画するY座標
+ * @param z 文字列を描画するZ座標
+ * @param font 使用するGLUTフォント
+ * @param string 描画する文字列
+ */
 void renderBitmapString(float x, float y, float z, void* font, const char* string) {
     glRasterPos3f(x, y, z);
     for (const char* c = string; *c != '\0'; c++) { glutBitmapCharacter(font, *c); }
 }
 
+/**
+ * @brief XYZ座標軸をデバッグ用に描画する。
+ */
 void drawAxes() {
     glDisable(GL_LIGHTING); glDisable(GL_TEXTURE_2D); glLineWidth(3.0f);
     glColor3f(1.0f, 0.0f, 0.0f); glBegin(GL_LINES); glVertex3f(0.0f, 0.1f, 0.0f); glVertex3f(10.0f, 0.1f, 0.0f); glEnd();
@@ -286,16 +499,24 @@ void drawAxes() {
     glLineWidth(1.0f); glEnable(GL_TEXTURE_2D); glEnable(GL_LIGHTING);
 }
 
+/**
+ * @brief 画面の右上にHUD（ヘッドアップディスプレイ）としてカメラ座標を表示する。
+ */
 void drawHUD() {
     glDisable(GL_LIGHTING); glDisable(GL_TEXTURE_2D); glDisable(GL_DEPTH_TEST);
-    glMatrixMode(GL_PROJECTION); glPushMatrix(); glLoadIdentity(); gluOrtho2D(0.0, windowWidth, 0.0, windowHeight);
+    glMatrixMode(GL_PROJECTION); glPushMatrix(); glLoadIdentity(); 
+    glOrtho(0.0, windowWidth, 0.0, windowHeight, -1.0, 1.0);
     glMatrixMode(GL_MODELVIEW); glPushMatrix(); glLoadIdentity();
     char coords[100]; sprintf(coords, "X: %.2f  Y: %.2f  Z: %.2f", cameraX, cameraY, cameraZ);
-    glColor3f(0.0f, 0.0f, 0.0f); renderBitmapString(windowWidth - 270, windowHeight - 30, 0, GLUT_BITMAP_HELVETICA_18, coords);
+    glColor3f(1.0f, 1.0f, 1.0f);
+    renderBitmapString(windowWidth - 270, windowHeight - 30, 0, GLUT_BITMAP_HELVETICA_18, coords);
     glPopMatrix(); glMatrixMode(GL_PROJECTION); glPopMatrix();
     glMatrixMode(GL_MODELVIEW); glEnable(GL_DEPTH_TEST); glEnable(GL_TEXTURE_2D); glEnable(GL_LIGHTING);
 }
 
+/**
+ * @brief 地面を描画する。
+ */
 void drawGround() {
     GLfloat ground_mat[] = {1.0f, 1.0f, 1.0f, 1.0f};
     glMaterialfv(GL_FRONT, GL_AMBIENT_AND_DIFFUSE, ground_mat);
@@ -310,12 +531,16 @@ void drawGround() {
     glEnd();
 }
 
+/**
+ * @brief ステージの壁を描画する。
+ */
 void drawWalls() {
     GLfloat wall_mat[] = {1.0f, 1.0f, 1.0f, 1.0f};
     glMaterialfv(GL_FRONT, GL_AMBIENT_AND_DIFFUSE, wall_mat);
     glEnable(GL_TEXTURE_2D);
     glBindTexture(GL_TEXTURE_2D, wallTextureID);
 
+    // テクスチャ付きの立方体を描画するヘルパーラムダ関数
     auto drawTexturedCube = [](float width, float height, float depth) {
         const float texRepeatScale = 1.0f;
         float texX = width * texRepeatScale;
@@ -356,6 +581,7 @@ void drawWalls() {
         glEnd();
     };
 
+    // 壁のセグメントを描画するヘルパーラムダ関数
     auto drawWallSegment = [&](float x, float y, float z, float width, float depth, float height, float rx, float ry, float rz) {
         glPushMatrix();
         glTranslatef(x + width / 2.0f, y + height / 2.0f, z + depth / 2.0f);
@@ -367,6 +593,7 @@ void drawWalls() {
         glPopMatrix();
     };
 
+    // Y軸方向に伸びる壁のセグメントを描画するヘルパーラムダ関数
     auto drawWallSegmentY = [&](float x, float y, float z, float width, float depth, float height, float rx, float ry, float rz) {
         glPushMatrix();
         glTranslatef(x + depth / 2.0f, y + height / 2.0f, z + width / 2.0f);
@@ -378,10 +605,12 @@ void drawWalls() {
         glPopMatrix();
     };
 
+    // drawWallSegmentのラッパー
     auto drawWall = [&](float x, float z, float width, float depth, float height, float rx, float ry, float rz) {
         drawWallSegment(x, 0.0f, z, width, depth, height, rx, ry, rz);
     };
 
+    // 窓のある壁を描画するヘルパーラムダ関数
     auto drawWindowWalls = [&](float x, float z, float width, float depth, float height, float rx, float ry, float rz) {
         const float windowWidthRatio = 0.4f;
         const float windowHeightRatio = 0.4f;
@@ -398,6 +627,7 @@ void drawWalls() {
         drawWallSegment(rightX, marginHeight, z, marginWidth, depth, windowHeight, rx, ry, rz);
     };
 
+    // Y軸方向に伸びる窓のある壁を描画するヘルパーラムダ関数
     auto drawWindowWallY = [&](float x, float z, float width, float depth, float height, float rx, float ry, float rz) {
         const float windowWidthRatio = 0.4f;
         const float windowHeightRatio = 0.4f;
@@ -414,6 +644,7 @@ void drawWalls() {
         drawWallSegmentY(x, marginHeight, rightZ, marginWidth, depth, windowHeight, rx, ry, rz);
     };
 
+    // 分割された壁を描画するヘルパーラムダ関数
     auto drawDividedWall = [&](float x, float z, float width, float depth, float height, float rx, float ry, float rz) {
         const float dividerThickness = 0.5f; 
         float sideWallWidth = (width - dividerThickness) / 2.0f;
@@ -445,7 +676,6 @@ void drawWalls() {
     drawWall(10.0f,-41.0f,wall_thick,3.0f,wall_height, 0.0f, 0.0f, 0.0f);
     drawWall(-10.0f,-31.0f,wall_thick,3.0f,wall_height, 0.0f, 0.0f, 0.0f);
     
-    // ★★★ 壁の描画を+45度に設定 ★★★
     drawWall(-30.0f, 2.0f, 15.0f, wall_thick, wall_height, 0.0f, -45.0f, 0.0f);
     drawWall(-40.0f, -2.0f, 15.0f, wall_thick, wall_height, 0.0f, -45.0f, 0.0f);
 
@@ -454,6 +684,13 @@ void drawWalls() {
     drawWindowWalls(0.0f, -40.0f, 10.0f, wall_thick, wall_height, 0.0f, 0.0f, 0.0f);
 }
 
+/**
+ * @brief 円柱を描画する。
+ * @param radius 円柱の半径
+ * @param height 円柱の高さ
+ * @param sides 円柱の側面を構成するポリゴンの数
+ * @param baseHeight 円柱の底面のY座標
+ */
 void drawCylinder(float radius, float height, int sides, float baseHeight = 0.0f) {
     glBegin(GL_QUAD_STRIP);
     for (int i = 0; i <= sides; i++) {
@@ -485,6 +722,9 @@ void drawCylinder(float radius, float height, int sides, float baseHeight = 0.0f
     glEnd();
 }
 
+/**
+ * @brief 木を描画する。（幹は円柱、葉は円錐で表現）
+ */
 void drawTree() {
     glDisable(GL_TEXTURE_2D);
 
@@ -520,6 +760,9 @@ void drawTree() {
     glEnable(GL_TEXTURE_2D);
 }
 
+/**
+ * @brief 落下する葉のパーティクルを描画する。
+ */
 void drawFallingLeaves() {
     glDisable(GL_LIGHTING);
     glEnable(GL_BLEND);
@@ -569,6 +812,13 @@ void drawFallingLeaves() {
     glEnable(GL_LIGHTING);
 }
 
+/**
+ * @brief 岩（テクスチャ付きの球体）を描画する。
+ * @param x ワールド座標X
+ * @param y ワールド座標Y
+ * @param z ワールド座標Z
+ * @param radius 岩の半径
+ */
 void drawRock(float x, float y, float z, float radius) {
     glEnable(GL_TEXTURE_2D);
     glBindTexture(GL_TEXTURE_2D, rockTextureID);
@@ -578,15 +828,15 @@ void drawRock(float x, float y, float z, float radius) {
 
     GLfloat rock_mat[] = {1.0f, 1.0f, 1.0f, 1.0f};
     glMaterialfv(GL_FRONT, GL_AMBIENT_AND_DIFFUSE, rock_mat);
-
-    GLUquadric* quad = gluNewQuadric();
-    gluQuadricTexture(quad, GL_TRUE);
-    gluSphere(quad, radius, 32, 32);
-    gluDeleteQuadric(quad);
+    
+    drawTexturedSphere(radius, 32, 32);
     
     glPopMatrix();
 }
 
+/**
+ * @brief デバッグ用に当たり判定（AABBとOBB）をワイヤーフレームで描画する。
+ */
 void drawColliders() {
     if (!showColliders) return;
 
@@ -660,6 +910,9 @@ void drawColliders() {
     glEnable(GL_LIGHTING);
 }
 
+/**
+ * @brief 壁やオブジェクトの当たり判定をセットアップする。
+ */
 void setupColliders() {
     wallColliders.clear();
     obbColliders.clear();
@@ -680,7 +933,6 @@ void setupColliders() {
     addCollider(10.0f,-41.0f,wall_thick,3.0f); 
     addCollider(-10.0f,-31.0f,wall_thick,3.0f); 
 
-    // ★★★ 当たり判定の角度を+45度に変更 ★★★
     float angle_rad = 45.0f * M_PI / 180.0f;
     float w = 15.0f;
     float d = wall_thick;
@@ -739,6 +991,10 @@ void setupColliders() {
     float rockZ = -35.0f;
     wallColliders.push_back({rockX - rockRadius, rockX + rockRadius, 0, 0, rockZ - rockRadius, rockZ + rockRadius});
 }
+
+/**
+ * @brief パレットオブジェクトを初期位置にセットアップする。
+ */
 void setupPallets() {
     BoundingBox palletBaseBBox = calculateModelBBox(paletModel);
     const float x_scale_factor = 16.0f;
@@ -755,21 +1011,38 @@ void setupPallets() {
     pallets.push_back({17.0f, 1.8f, -0.4f, 0.0f, 90.0f, 0.0f, 'z', palletBaseBBox, IDLE, 1.8f, 0.15f, false});
 }
 
+/**
+ * @brief メインの描画関数。glutDisplayFuncに登録される。
+ */
 void display() {
     glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
     glLoadIdentity();
-    float lookX = cos(pitch) * cos(yaw), lookY = sin(pitch), lookZ = cos(pitch) * sin(yaw);
-    gluLookAt(cameraX, cameraY, cameraZ, cameraX + lookX, cameraY + lookY, cameraZ + lookZ, 0.0f, 1.0f, 0.0f);
+
+    float lookX = cos(pitch) * cos(yaw);
+    float lookY = sin(pitch);
+    float lookZ = cos(pitch) * sin(yaw);
+    float lookAtMat[16];
+    lookAtMatrix(lookAtMat, {cameraX, cameraY, cameraZ}, {cameraX + lookX, cameraY + lookY, cameraZ + lookZ}, {0.0f, 1.0f, 0.0f});
+    glMultMatrixf(lookAtMat);
     
     glEnable(GL_TEXTURE_2D);
     drawGround();
     drawWalls();
     drawTree();
-    drawAxes();
+    // drawAxes(); // 軸の表示を無効化
     drawObjModel(blenderModel, 30.0f, 3.0f, 30.0f, 3.0f, 0.0f, 180.0f, 0.0f);
+    
     for (const auto& pallet : pallets) {
-        drawObjModel(paletModel, pallet.x, pallet.visualY, pallet.z, pallet.scale, pallet.rotationX, pallet.rotationY, pallet.rotationZ);
+        float emission_intensity = (sin(g_time * 4.0f) + 1.0f) / 2.0f;
+        GLfloat pallet_emission[] = {
+            emission_intensity * 0.8f, 
+            emission_intensity * 0.8f, 
+            emission_intensity * 0.5f, 
+            1.0f
+        };
+        drawObjModel(paletModel, pallet.x, pallet.visualY, pallet.z, pallet.scale, pallet.rotationX, pallet.rotationY, pallet.rotationZ, pallet_emission);
     }
+
     drawFallingLeaves();
     drawRock(-35.0f, 0.0f, -35.0f, 5.0f); 
 
@@ -779,6 +1052,9 @@ void display() {
     glutSwapBuffers();
 }
 
+/**
+ * @brief パレットの状態（アニメーション、当たり判定追加など）を更新する。
+ */
 void updatePallets() {
     for (auto& pallet : pallets) {
         if (pallet.state == TIPPING) {
@@ -800,19 +1076,12 @@ void updatePallets() {
             }
         }
 
-        // ★★★ ここからが修正箇所 ★★★
-        // パレットが倒れきって、まだ当たり判定が追加されていない場合
         if (pallet.state == TIPPED && !pallet.collisionAdded) {
-            // パレットはY軸で90度回転しているため、ワールド空間での幅と奥行きは
-            // モデルのローカル空間でのX(厚み)とZ(長さ)が入れ替わったものに近くなる
-            // ただし、OBBの角度で調整するため、widthはモデルのX、depthはモデルのZで計算
             float halfWidth = (pallet.localBBox.maxX - pallet.localBBox.minX) * pallet.scale / 2.0f;
             float halfDepth = (pallet.localBBox.maxZ - pallet.localBBox.minZ) * pallet.scale / 2.0f;
             
-            // Y軸周りの回転をラジアンに変換
             float angle_rad = pallet.rotationY * M_PI / 180.0f;
             
-            // 新しいOBBを作成し、パラメータを設定
             OBB newCollider;
             newCollider.cx = pallet.x;
             newCollider.cz = pallet.z;
@@ -820,20 +1089,21 @@ void updatePallets() {
             newCollider.halfDepth = halfDepth;
             newCollider.angle = angle_rad;
             
-            // グローバルなOBBリストに当たり判定を追加
             obbColliders.push_back(newCollider);
             
-            // フラグを立てて、重複して追加されるのを防ぐ
             pallet.collisionAdded = true;
 
             std::cout << "Added OBB collider for tipped pallet." << std::endl;
         }
-        // ★★★ 修正ここまで ★★★
 
         pallet.visualY = pallet.y + sin(g_time * 4.0f) * 0.05f;
     }
 }
 
+/**
+ * @brief 新しい葉パーティクルを生成する。
+ * @param treeCenterY 木の中心Y座標
+ */
 void spawnLeaf(float treeCenterY) {
     std::uniform_real_distribution<float> distAngle(0.0f, 2.0f * M_PI);
     std::uniform_real_distribution<float> distRadius(0.0f, treeLeafSpawnRadius);
@@ -877,6 +1147,10 @@ void spawnLeaf(float treeCenterY) {
     fallingLeaves.push_back(newLeaf);
 }
 
+/**
+ * @brief 落下する葉パーティクルの位置、回転、速度を更新する。
+ * @param deltaTime 前フレームからの経過時間
+ */
 void updateFallingLeaves(float deltaTime) {
     for (auto& leaf : fallingLeaves) {
         leaf.x += leaf.vx * deltaTime;
@@ -919,6 +1193,14 @@ void updateFallingLeaves(float deltaTime) {
     }
 }
 
+/**
+ * @brief プレイヤーとAABB（軸並行境界ボックス）の当たり判定をチェックし、押し出しベクトルを計算する。
+ * @param newX プレイヤーの次のX座標
+ * @param newZ プレイヤーの次のZ座標
+ * @param correctionX 衝突解決のためのX方向の押し出しベクトル（出力）
+ * @param correctionZ 衝突解決のためのZ方向の押し出しベクトル（出力）
+ * @return 衝突が発生したかどうか (true/false)
+ */
 bool checkAABBCollision(float newX, float newZ, float& correctionX, float& correctionZ) {
     correctionX = 0.0f;
     correctionZ = 0.0f;
@@ -958,6 +1240,14 @@ bool checkAABBCollision(float newX, float newZ, float& correctionX, float& corre
     return false;
 }
 
+/**
+ * @brief プレイヤーとOBB（有向境界ボックス）の当たり判定をチェックし、押し出しベクトルを計算する。
+ * @param newX プレイヤーの次のX座標
+ * @param newZ プレイヤーの次のZ座標
+ * @param correctionX 衝突解決のためのX方向の押し出しベクトル（出力）
+ * @param correctionZ 衝突解決のためのZ方向の押し出しベクトル（出力）
+ * @return 衝突が発生したかどうか (true/false)
+ */
 bool checkOBBCollision(float newX, float newZ, float& correctionX, float& correctionZ) {
     correctionX = 0.0f;
     correctionZ = 0.0f;
@@ -1004,7 +1294,10 @@ bool checkOBBCollision(float newX, float newZ, float& correctionX, float& correc
     return false;
 }
 
-
+/**
+ * @brief ゲームの状態を更新するメインループ。glutTimerFuncによって定期的に呼び出される。
+ * @param value glutTimerFuncから渡される整数値（ここでは未使用）
+ */
 void update(int value) {
     float deltaTime = 1.0f / 60.0f;
     g_time += deltaTime;
@@ -1046,6 +1339,12 @@ void update(int value) {
     glutTimerFunc(16, update, 0);
 }
 
+/**
+ * @brief キーボードが押されたときの処理を行う。glutKeyboardFuncに登録される。
+ * @param key 押されたキーのASCIIコード
+ * @param x マウスカーソルのX座標
+ * @param y マウスカーソルのY座標
+ */
 void keyboard(unsigned char key, int x, int y) {
     keyStates[tolower(key)] = true;
     switch (key) {
@@ -1072,8 +1371,19 @@ void keyboard(unsigned char key, int x, int y) {
     }
 }
 
+/**
+ * @brief キーボードが離されたときの処理を行う。glutKeyboardUpFuncに登録される。
+ * @param key 離されたキーのASCIIコード
+ * @param x マウスカーソルのX座標
+ * @param y マウスカーソルのY座標
+ */
 void keyboardUp(unsigned char key, int x, int y) { keyStates[tolower(key)] = false; }
 
+/**
+ * @brief マウスが動いたときの処理を行い、カメラの向きを更新する。glutPassiveMotionFuncに登録される。
+ * @param x マウスカーソルのX座標
+ * @param y マウスカーソルのY座標
+ */
 void mouseMotion(int x, int y) {
     if (!isMouseLookActive) return;
 
@@ -1136,14 +1446,30 @@ void mouseMotion(int x, int y) {
     }
 }
 
+/**
+ * @brief ウィンドウサイズが変更されたときの処理を行う。glutReshapeFuncに登録される。
+ * @param w 新しいウィンドウの幅
+ * @param h 新しいウィンドウの高さ
+ */
 void reshape(int w, int h) {
-    windowWidth = w; windowHeight = h;
+    windowWidth = w; 
+    windowHeight = h > 0 ? h : 1;
     glViewport(0, 0, w, h);
-    glMatrixMode(GL_PROJECTION); glLoadIdentity();
-    gluPerspective(45.0, (double)w / (double)h, 0.1, 200.0);
+    glMatrixMode(GL_PROJECTION); 
+    glLoadIdentity();
+    
+    float aspect = (double)w / (double)h;
+    float perspectiveMat[16];
+    perspectiveMatrix(perspectiveMat, 45.0, aspect, 0.1, 200.0);
+    glLoadMatrixf(perspectiveMat);
+
     glMatrixMode(GL_MODELVIEW);
 }
 
+/**
+ * @brief マウスカーソルがウィンドウ内に入った/出たときの処理を行う。glutEntryFuncに登録される。
+ * @param state マウスカーソルの状態 (GLUT_ENTERED or GLUT_LEFT)
+ */
 void entry(int state) {
     if (state == GLUT_ENTERED) {
         isMouseLookActive = true;
@@ -1153,20 +1479,29 @@ void entry(int state) {
     }
 }
 
+/**
+ * @brief シーンの初期化を行う。背景色、照明、テクスチャ、モデルの読み込みなどを実行する。
+ */
 void initScene() {
-    glClearColor(0.5f, 0.8f, 1.0f, 1.0f);
+    glClearColor(0.05f, 0.05f, 0.15f, 1.0f);
     glEnable(GL_DEPTH_TEST);
     glEnable(GL_NORMALIZE);
     glEnable(GL_LIGHTING);
     glEnable(GL_LIGHT0);
-    GLfloat global_ambient[] = { 0.4f, 0.4f, 0.4f, 1.0f };
+    GLfloat global_ambient[] = { 0.1f, 0.1f, 0.15f, 1.0f };
     glLightModelfv(GL_LIGHT_MODEL_AMBIENT, global_ambient);
     GLfloat light_pos[] = { 5.0f, 10.0f, 5.0f, 1.0f };
     glLightfv(GL_LIGHT0, GL_POSITION, light_pos);
-    GLfloat light_diffuse[] = {1.0f, 1.0f, 1.0f, 1.0f};
+    GLfloat light_diffuse[] = {0.5f, 0.5f, 0.7f, 1.0f};
     glLightfv(GL_LIGHT0, GL_DIFFUSE, light_diffuse);
-    GLfloat light_specular[] = {1.0f, 1.0f, 1.0f, 1.0f};
+    GLfloat light_specular[] = {0.7f, 0.7f, 0.8f, 1.0f};
     glLightfv(GL_LIGHT0, GL_SPECULAR, light_specular);
+
+    glEnable(GL_FOG);
+    GLfloat fogColor[] = {0.05f, 0.05f, 0.15f, 1.0f};
+    glFogi(GL_FOG_MODE, GL_EXP2);
+    glFogfv(GL_FOG_COLOR, fogColor);
+    glFogf(GL_FOG_DENSITY, 0.015f);
     
     if (!loadTexture("ground.jpg", groundTextureID)) { 
         printf("Failed to load ground texture.\n"); 
@@ -1189,12 +1524,18 @@ void initScene() {
     initPerlinNoise();
 }
 
+/**
+ * @brief メイン関数。プログラムのエントリーポイント。
+ * @param argc コマンドライン引数の数
+ * @param argv コマンドライン引数の配列
+ * @return 終了コード
+ */
 int main(int argc, char** argv) {
     setlocale(LC_NUMERIC, "C");
     glutInit(&argc, argv);
     glutInitDisplayMode(GLUT_DOUBLE | GLUT_RGB | GLUT_DEPTH);
     glutInitWindowSize(windowWidth, windowHeight);
-    glutCreateWindow("3D FPS Controller - Original Logic");
+    glutCreateWindow("3D FPS Controller - GLU Free Version (Night)");
     glutFullScreen();
     initScene();
     glutIgnoreKeyRepeat(1);
